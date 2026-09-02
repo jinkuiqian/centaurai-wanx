@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export const DEFAULT_PROXY_RUN_CASE_ID = 'customer-follow-up-normal-v1';
@@ -309,18 +309,12 @@ export class EvaluationProjectStore {
       currentRevision: evalRevision,
       revisions: [...current.evalState.revisions, evaluation],
     });
-    const paths = evaluationPaths(this.dataRoot, project);
-    await Promise.all([
-      atomicWrite(paths.entrypoint, definition.workflowSource, this.createPendingId),
-      atomicWrite(paths.workflow, `${JSON.stringify(workflow, null, 2)}\n`, this.createPendingId),
-      atomicWrite(paths.dataContract, `${JSON.stringify(dataContract, null, 2)}\n`, this.createPendingId),
-    ]);
-    await this.#saveState(project, evalState);
-    await atomicWrite(paths.agent, `${JSON.stringify(agent, null, 2)}\n`, this.createPendingId);
     const history = appendAgentVersion({ schemaVersion: 1, versions: current.versions }, agentVersionSnapshot({
       agent, dataContract, workflow, evaluation, source: definition.workflowSource,
     }));
-    await this.#saveHistory(project, history);
+    await this.#commitAgentUpdate(project, {
+      source: definition.workflowSource, workflow, dataContract, agent, evalState, history,
+    });
     return {
       agent: structuredClone(agent),
       dataContract: structuredClone(dataContract),
@@ -359,12 +353,6 @@ export class EvaluationProjectStore {
       ...evalState,
       revisions: evalState.revisions.map((item) => item.revision === nextEvaluation.revision ? nextEvaluation : item),
     };
-    await Promise.all([
-      atomicWrite(paths.workflow, `${JSON.stringify(nextWorkflow, null, 2)}\n`, this.createPendingId),
-      atomicWrite(paths.dataContract, `${JSON.stringify(nextDataContract, null, 2)}\n`, this.createPendingId),
-    ]);
-    await this.#saveState(project, nextEvalState);
-    await atomicWrite(paths.agent, `${JSON.stringify(nextAgent, null, 2)}\n`, this.createPendingId);
     const history = appendAgentVersion(validateAgentHistory(historyValue), agentVersionSnapshot({
       agent: nextAgent,
       dataContract: nextDataContract,
@@ -372,7 +360,10 @@ export class EvaluationProjectStore {
       evaluation: nextEvaluation,
       source,
     }));
-    await this.#saveHistory(project, history);
+    await this.#commitAgentUpdate(project, {
+      source, workflow: nextWorkflow, dataContract: nextDataContract,
+      agent: nextAgent, evalState: nextEvalState, history,
+    });
     return {
       agent: structuredClone(nextAgent),
       dataContract: structuredClone(nextDataContract),
@@ -429,6 +420,35 @@ export class EvaluationProjectStore {
     await atomicWrite(paths.historyMirror, rendered, this.createPendingId);
   }
 
+  async #commitAgentUpdate(project, update) {
+    const paths = evaluationPaths(this.dataRoot, project);
+    const transaction = validateAgentUpdateTransaction({ schemaVersion: 1, ...update });
+    await atomicWrite(paths.updatePending, `${JSON.stringify(transaction, null, 2)}\n`, this.createPendingId);
+    await this.#applyAgentUpdate(project, paths, transaction);
+    await unlink(paths.updatePending);
+  }
+
+  async #applyAgentUpdate(project, paths, transaction) {
+    await Promise.all([
+      atomicWrite(paths.entrypoint, transaction.source, this.createPendingId),
+      atomicWrite(paths.workflow, `${JSON.stringify(transaction.workflow, null, 2)}\n`, this.createPendingId),
+      atomicWrite(paths.dataContract, `${JSON.stringify(transaction.dataContract, null, 2)}\n`, this.createPendingId),
+    ]);
+    await this.#saveState(project, transaction.evalState);
+    await atomicWrite(paths.agent, `${JSON.stringify(transaction.agent, null, 2)}\n`, this.createPendingId);
+    await this.#saveHistory(project, transaction.history);
+  }
+
+  async #recoverAgentUpdate(project, paths) {
+    const value = await readOptionalJson(
+      paths.updatePending, 'agent_update_transaction_corrupt', '工作 Agent 恢复记录已损坏。',
+    );
+    if (value === null) return;
+    const transaction = validateAgentUpdateTransaction(value);
+    await this.#applyAgentUpdate(project, paths, transaction);
+    await unlink(paths.updatePending);
+  }
+
   async #ensure(project) {
     const paths = evaluationPaths(this.dataRoot, project);
     await Promise.all([
@@ -448,6 +468,7 @@ export class EvaluationProjectStore {
       validateArtifactFile(artifactRoot, paths.entrypoint),
     ]);
     await migrateLegacyDefaults(paths, this.createPendingId);
+    await this.#recoverAgentUpdate(project, paths);
     return paths;
   }
 }
@@ -525,6 +546,7 @@ function evaluationPaths(dataRoot, project) {
     canonical: path.join(dataRoot, 'evaluations', `${digest(project.workspaceId)}.json`),
     historyCanonical: path.join(dataRoot, 'agent-versions', `${digest(project.workspaceId)}.json`),
     historyMirror: path.join(artifactRoot, AGENT_VERSION_HISTORY),
+    updatePending: path.join(dataRoot, 'agent-updates', `${digest(project.workspaceId)}.json`),
   };
 }
 
@@ -708,6 +730,40 @@ function validateAgentHistory(value) {
     throw evaluationError('agent_history_corrupt', '工作 Agent 历史版本号不能重复。', 500);
   }
   return { schemaVersion: 1, versions };
+}
+
+function validateAgentUpdateTransaction(value) {
+  if (!isPlainObject(value) || value.schemaVersion !== 1 || typeof value.source !== 'string'
+    || Buffer.byteLength(value.source) > 64 * 1024) {
+    throw evaluationError('agent_update_transaction_corrupt', '工作 Agent 恢复记录已损坏。', 500);
+  }
+  const workflow = validateWorkflow(value.workflow);
+  const evalState = validateEvalState(value.evalState);
+  const evaluation = evalState.revisions.find(
+    (candidate) => candidate.revision === evalState.currentRevision && candidate.status === 'confirmed',
+  );
+  const generated = validateGeneratedArtifacts(value.agent, value.dataContract, workflow, evaluation);
+  const history = validateAgentHistory(value.history);
+  const snapshot = agentVersionSnapshot({
+    agent: generated.agent,
+    dataContract: generated.dataContract,
+    workflow,
+    evaluation,
+    source: value.source,
+  });
+  const archived = history.versions.find((item) => item.agentVersion === snapshot.agentVersion);
+  if (!archived || JSON.stringify(archived) !== JSON.stringify(snapshot)) {
+    throw evaluationError('agent_update_transaction_corrupt', '工作 Agent 恢复记录与版本档案不一致。', 500);
+  }
+  return {
+    schemaVersion: 1,
+    source: value.source,
+    workflow: structuredClone(workflow),
+    dataContract: structuredClone(generated.dataContract),
+    agent: structuredClone(generated.agent),
+    evalState: structuredClone(evalState),
+    history: structuredClone(history),
+  };
 }
 
 function validCapabilities(value) {

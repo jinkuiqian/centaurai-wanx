@@ -116,7 +116,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.sessionProjections.register(createWorkRunProjectionDefinition()));
   ctx.effect(() => ctx.tools.register(evaluationTool));
   ctx.effect(() => ctx.tools.register(createWorkAgentGenerationTool(
-    service, evaluationStore, evaluationTool, generationEvaluations,
+    service, evaluationStore, evaluationTool, generationEvaluations, workRun,
   )));
   ctx.effect(() => ctx.tools.register(createRunFeedbackChangeTool(service)));
   ctx.effect(() => ctx.on('tools/pre-execute', automaticEvaluation.before));
@@ -304,7 +304,9 @@ export function apply(ctx) {
   }));
 }
 
-export function createWorkAgentGenerationTool(service, evaluationStore, evaluationTool, evaluatedExecutions = null) {
+export function createWorkAgentGenerationTool(
+  service, evaluationStore, evaluationTool, evaluatedExecutions = null, workRun = null,
+) {
   return {
     name: 'wanxiang_generate_work_agent',
     description: 'Generate the current project\'s smallest deterministic work Agent from its active confirmed work description. Creates task-specific contracts and one protected smoke case; the Host automatically runs the Eval after generation.',
@@ -343,6 +345,7 @@ export function createWorkAgentGenerationTool(service, evaluationStore, evaluati
           workflowVersion: { type: 'string' },
           evalRevision: { type: 'integer' },
           smokeCaseId: { type: 'string' },
+          feedbackRerunIds: { type: 'array', items: { type: 'string' } },
         },
         required: ['ok', 'agentVersion', 'workBriefRevision', 'workflowVersion', 'evalRevision', 'smokeCaseId'],
       },
@@ -371,20 +374,57 @@ export function createWorkAgentGenerationTool(service, evaluationStore, evaluati
         throw serviceError(503, 'agent_generation_unavailable', '工作 Agent 生成环境尚未就绪。');
       }
       const answers = state.brief.confirmedAnswers;
-      const generated = await evaluationStore.generate({
-        workspaceId: String(context.workspaceId),
-        workspacePath: context.workspacePath,
-      }, {
-        ...args,
-        projectName: state.projectName,
-        workBriefRevision: state.brief.confirmedRevision,
-        brief: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, answers[key]])),
-      });
-      evaluatedExecutions?.add(execution);
-      const smokeCaseId = generated.eval.cases[0].id;
-      const smokeRun = await evaluationTool.execute({ caseId: smokeCaseId }, execution);
-      if (smokeRun?.status !== 'passed') {
-        throw serviceError(409, 'agent_generation_smoke_failed', '工作 Agent 已生成，但冒烟案例未通过；请根据运行证据修正后重试。');
+      const acceptedContractImprovements = (state.improvements?.order || [])
+        .map((improvementId) => state.improvements.byId[improvementId])
+        .filter((item) => item.kind === 'contract' && item.status === 'accepted');
+      let generated = null;
+      let smokeCaseId = null;
+      const feedbackRerunIds = [];
+      try {
+        generated = await evaluationStore.generate({
+          workspaceId: String(context.workspaceId),
+          workspacePath: context.workspacePath,
+        }, {
+          ...args,
+          projectName: state.projectName,
+          workBriefRevision: state.brief.confirmedRevision,
+          brief: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, answers[key]])),
+        });
+        evaluatedExecutions?.add(execution);
+        smokeCaseId = generated.eval.cases[0].id;
+        const smokeRun = await evaluationTool.execute({ caseId: smokeCaseId }, execution);
+        if (smokeRun?.status !== 'passed') {
+          throw serviceError(409, 'agent_generation_smoke_failed', '工作 Agent 已生成，但冒烟案例未通过；请根据运行证据修正后重试。');
+        }
+        if (acceptedContractImprovements.length && typeof workRun?.retryFeedback !== 'function') {
+          throw serviceError(503, 'feedback_retry_unavailable', '契约更新后的真实案例重跑环境尚未就绪。');
+        }
+        for (const improvement of acceptedContractImprovements) {
+          const rerun = await workRun.retryFeedback(improvement.feedbackId, execution);
+          await service.completeRunFeedbackChange(String(context.workspaceId), {
+            improvementId: improvement.id,
+            afterAgentVersion: generated.agent.agentVersion,
+            rerunId: rerun.runId,
+            evalRevision: generated.agent.evalRevision,
+          });
+          feedbackRerunIds.push(rerun.runId);
+        }
+      } catch (error) {
+        await Promise.all(acceptedContractImprovements.map((improvement) => (
+          service.failRunFeedbackChange?.(String(context.workspaceId), {
+            improvementId: improvement.id,
+            ...(generated?.agent?.agentVersion ? { afterAgentVersion: generated.agent.agentVersion } : {}),
+            ...(Number.isInteger(generated?.agent?.workBriefRevision)
+              ? { workBriefRevision: generated.agent.workBriefRevision } : {}),
+            ...(Number.isInteger(generated?.agent?.evalRevision)
+              ? { evalRevision: generated.agent.evalRevision } : {}),
+            error: {
+              code: typeof error?.code === 'string' ? error.code : 'feedback_change_failed',
+              message: error instanceof Error ? error.message : '契约反馈修改未能完成。',
+            },
+          }).catch(() => {})
+        )));
+        throw error;
       }
       return {
         ok: true,
@@ -393,6 +433,7 @@ export function createWorkAgentGenerationTool(service, evaluationStore, evaluati
         workflowVersion: generated.agent.workflowVersion,
         evalRevision: generated.agent.evalRevision,
         smokeCaseId,
+        ...(feedbackRerunIds.length ? { feedbackRerunIds } : {}),
       };
     },
   };
@@ -576,7 +617,13 @@ export function createRunFeedbackChangeTool(service) {
         contractPatch: {
           type: 'object',
           additionalProperties: false,
-          properties: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, { type: 'string' }])),
+          properties: {
+            ...Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, { type: 'string' }])),
+            permissions: {
+              type: 'string',
+              description: 'Requested permission change. Confirmation records the request but never bypasses the Host safety ceiling.',
+            },
+          },
         },
       },
       required: ['baseStateVersion', 'feedbackId', 'kind'],
@@ -604,7 +651,7 @@ export function createRunFeedbackChangeTool(service) {
         throw serviceError(403, 'feedback_change_session_required', '需要在原制作会话中处理反馈。');
       }
       const contractPatch = kind === 'contract'
-        ? validateProjectPatch({ answers: requireObject(input.contractPatch, '请提供工作说明差异。') }).answers
+        ? validateFeedbackContractPatch(input.contractPatch)
         : undefined;
       const state = await service.planRunFeedbackChange(
         String(context.workspaceId), baseVersion,
@@ -1307,6 +1354,18 @@ function validateAnswerPatch(value, { requireNonEmpty = false } = {}) {
     throw serviceError(400, 'empty_patch', '至少更新一项工作说明。');
   }
   return answers;
+}
+
+function validateFeedbackContractPatch(value) {
+  const raw = requireObject(value, '请提供工作说明差异。');
+  const labels = new Map([...BRIEF_FIELDS, ['permissions', '权限']]);
+  rejectUnknownKeys(raw, [...labels.keys()], '工作说明差异');
+  const patch = Object.fromEntries(Object.entries(raw)
+    .map(([key, answer]) => [key, draftText(answer, labels.get(key), 12_000)]));
+  if (!Object.keys(patch).length) {
+    throw serviceError(400, 'empty_patch', '工作说明提案不能为空。');
+  }
+  return patch;
 }
 
 function validateFieldSourcePatch(value) {

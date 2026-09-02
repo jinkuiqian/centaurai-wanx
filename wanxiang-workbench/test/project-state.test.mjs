@@ -1180,17 +1180,27 @@ test('contract-changing feedback stays proposed until accepted and rejected prop
   const proposed = await service.planRunFeedbackChange(workspace.id, state.stateVersion, {
     feedbackId,
     kind: 'contract',
-    contractPatch: { boundaries: '允许预览后由成员确认发送给外部客户' },
+    contractPatch: {
+      boundaries: '允许预览后由成员确认发送给外部客户',
+      permissions: '需要读取公开网络；外部发送仍需成员逐次确认',
+    },
   }, 'session-1');
   const proposalId = proposed.improvements.order.at(-1);
   const proposal = proposed.improvements.byId[proposalId];
 
   assert.equal(proposal.status, 'awaiting_confirmation');
   assert.equal(proposal.before.agentVersion, '1.0.0');
-  assert.deepEqual(proposal.diff, [{
-    field: 'boundaries', label: '排除项与风险边界',
-    before: activeContract.boundaries, after: '允许预览后由成员确认发送给外部客户',
-  }]);
+  assert.deepEqual(proposal.diff, [
+    {
+      field: 'boundaries', label: '排除项与风险边界',
+      before: activeContract.boundaries, after: '允许预览后由成员确认发送给外部客户',
+    },
+    {
+      field: 'permissions', label: '权限',
+      before: '工作 Agent 仅可读写当前项目；Workflow 禁止网络和外部副作用',
+      after: '需要读取公开网络；外部发送仍需成员逐次确认',
+    },
+  ]);
   assert.deepEqual(proposed.brief.answers, activeContract);
   assert.deepEqual(proposed.brief.confirmedAnswers, activeContract);
 
@@ -1204,20 +1214,67 @@ test('contract-changing feedback stays proposed until accepted and rejected prop
   const reproposed = await service.planRunFeedbackChange(workspace.id, rejected.stateVersion, {
     feedbackId,
     kind: 'contract',
-    contractPatch: { boundaries: '允许预览后由成员确认发送给外部客户' },
+    contractPatch: {
+      boundaries: '允许预览后由成员确认发送给外部客户',
+      permissions: '需要读取公开网络；外部发送仍需成员逐次确认',
+    },
   }, 'session-1');
   const acceptedProposalId = reproposed.improvements.order.at(-1);
   const accepted = await service.decideRunFeedbackChange(workspace.id, reproposed.stateVersion, {
     improvementId: acceptedProposalId, decision: 'accept',
   }, 'session-1');
   assert.equal(accepted.improvements.byId[acceptedProposalId].status, 'accepted');
-  assert.equal(accepted.brief.answers.boundaries, '允许预览后由成员确认发送给外部客户');
+  assert.equal(accepted.brief.answers.boundaries,
+    '允许预览后由成员确认发送给外部客户\n\n权限要求（仍受当前产品安全上限约束）：需要读取公开网络；外部发送仍需成员逐次确认');
   assert.deepEqual(accepted.brief.confirmedAnswers, activeContract);
+
+  const confirmed = await service.confirmProject(
+    workspace.id, accepted.stateVersion, accepted.brief.revision,
+  );
+  const permissionReproposal = await service.planRunFeedbackChange(workspace.id, confirmed.stateVersion, {
+    feedbackId,
+    kind: 'contract',
+    contractPatch: { permissions: '仅需读取公开网络；禁止任何外部写入' },
+  }, 'session-1');
+  const permissionProposalId = permissionReproposal.improvements.order.at(-1);
+  assert.deepEqual(permissionReproposal.improvements.byId[permissionProposalId].diff, [{
+    field: 'permissions', label: '权限',
+    before: '需要读取公开网络；外部发送仍需成员逐次确认',
+    after: '仅需读取公开网络；禁止任何外部写入',
+  }]);
+  const permissionAccepted = await service.decideRunFeedbackChange(
+    workspace.id, permissionReproposal.stateVersion,
+    { improvementId: permissionProposalId, decision: 'accept' }, 'session-1',
+  );
+  assert.equal(permissionAccepted.brief.answers.boundaries,
+    '允许预览后由成员确认发送给外部客户\n\n权限要求（仍受当前产品安全上限约束）：仅需读取公开网络；禁止任何外部写入');
+  await service.startRealWorkRun(workspace.id, {
+    runId: 'run-contract-after', sessionId: 'session-1', caseId: 'real-case-contract-1', caseTitle: '真实案例',
+    agentVersion: '1.0.1', workflowVersion: '1.0.1', evalRevision: 3,
+    workBriefRevision: permissionAccepted.brief.revision, input: { text: '原输入' }, retryOf: 'run-contract-1',
+    startedAt: '2026-09-02T10:04:00.000Z',
+  });
+  let completedContract = await service.finishRun(workspace.id, {
+    runId: 'run-contract-after', status: 'passed', conclusion: 'passed',
+    completedAt: '2026-09-02T10:04:01.000Z', evidence: { output: { value: '新版结果' } },
+  });
+  completedContract = await service.completeRunFeedbackChange(workspace.id, {
+    improvementId: permissionProposalId,
+    afterAgentVersion: '1.0.1',
+    rerunId: 'run-contract-after',
+    evalRevision: 3,
+  });
+  assert.equal(completedContract.improvements.byId[permissionProposalId].status, 'completed');
+  assert.deepEqual(completedContract.improvements.byId[permissionProposalId].after, {
+    agentVersion: '1.0.1',
+    workBriefRevision: permissionAccepted.brief.revision,
+    evalRevision: 3,
+  });
 
   const restarted = serviceFor(registryFor(workspace), { dataRoot, runtimeId: 'runtime-2' });
   const recovered = await restarted.getProject(workspace.id);
   assert.deepEqual(recovered.improvements.byId[proposalId], rejected.improvements.byId[proposalId]);
-  assert.deepEqual(recovered.improvements.byId[acceptedProposalId], accepted.improvements.byId[acceptedProposalId]);
+  assert.deepEqual(recovered.improvements.byId[permissionProposalId], completedContract.improvements.byId[permissionProposalId]);
 });
 
 test('in-contract feedback improvement links the original run, immutable versions and automatic rerun result', async (t) => {
@@ -1267,6 +1324,51 @@ test('in-contract feedback improvement links the original run, immutable version
   assert.equal(improvement.rerunId, 'run-after');
   assert.deepEqual(state.runs.byId['run-before'], historicalRun);
   assert.deepEqual(state.feedback.byId[feedbackId], historicalFeedback);
+
+  await service.startRealWorkRun(workspace.id, {
+    runId: 'run-other', sessionId: 'session-1', caseId: 'case-other', caseTitle: '另一真实案例',
+    agentVersion: '1.0.1', workflowVersion: '1.0.1', evalRevision: 2, workBriefRevision: 3,
+    input: { text: '另一输入' }, retryOf: null, startedAt: '2026-09-02T10:02:00.000Z',
+  });
+  state = await service.finishRun(workspace.id, {
+    runId: 'run-other', status: 'passed', conclusion: 'passed', completedAt: '2026-09-02T10:02:01.000Z',
+    evidence: { output: { value: '另一结果' } },
+  });
+  state = await service.recordRunFeedback(workspace.id, state.stateVersion, {
+    runId: 'run-other', verdict: 'needs_changes', note: '另一案例需要修改。',
+  }, 'session-1');
+  const otherFeedbackId = state.feedback.order.at(-1);
+  state = await service.planRunFeedbackChange(workspace.id, state.stateVersion, {
+    feedbackId: otherFeedbackId, kind: 'implementation',
+  }, 'session-1');
+  const otherImprovementId = state.improvements.order.at(-1);
+  await service.startRealWorkRun(workspace.id, {
+    runId: 'run-other-after', sessionId: 'session-1', caseId: 'case-other', caseTitle: '另一真实案例',
+    agentVersion: '1.0.2', workflowVersion: '1.0.2', evalRevision: 2, workBriefRevision: 3,
+    input: { text: '另一输入' }, retryOf: 'run-other', startedAt: '2026-09-02T10:03:00.000Z',
+  });
+  state = await service.finishRun(workspace.id, {
+    runId: 'run-other-after', status: 'passed', conclusion: 'passed', completedAt: '2026-09-02T10:03:01.000Z',
+    evidence: { output: { value: '另一修正结果' } },
+  });
+  state = await service.completeRunFeedbackChange(workspace.id, {
+    improvementId: otherImprovementId,
+    afterAgentVersion: '1.0.2',
+    rerunId: 'run-other-after',
+    evalRevision: 2,
+  });
+
+  state = await service.recordRunFeedback(workspace.id, state.stateVersion, {
+    runId: 'run-before', verdict: 'needs_changes', note: '同一原运行的另一处格式仍需修正。',
+  }, 'session-1');
+  const secondFeedbackId = state.feedback.order.at(-1);
+  const nextAttempt = await service.planRunFeedbackChange(workspace.id, state.stateVersion, {
+    feedbackId: secondFeedbackId, kind: 'implementation',
+  }, 'session-1');
+  const nextImprovement = nextAttempt.improvements.byId[nextAttempt.improvements.order.at(-1)];
+  assert.deepEqual(nextImprovement.before, {
+    agentVersion: '1.0.2', workBriefRevision: 3, evalRevision: 2,
+  });
 });
 
 test('project creation requires a host-owned root', async () => {

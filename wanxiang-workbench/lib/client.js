@@ -163,18 +163,17 @@ window.__ModuleLoader__.load({
         byId: Object.fromEntries(order.map((runId) => [runId, rawById[runId]])),
       };
     }
-    function normalizeFeedback(value) {
+    function normalizeOrderedStore(value) {
       const source = value && typeof value === "object" ? value : {};
       const rawById = source.byId && typeof source.byId === "object" ? source.byId : {};
-      const order = Array.isArray(source.order) ? source.order.filter((feedbackId) => typeof feedbackId === "string" && rawById[feedbackId]) : [];
-      return { order, byId: Object.fromEntries(order.map((feedbackId) => [feedbackId, rawById[feedbackId]])) };
+      const order = Array.isArray(source.order) ? source.order.filter((id) => typeof id === "string" && rawById[id]) : [];
+      return { order, byId: Object.fromEntries(order.map((id) => [id, rawById[id]])) };
+    }
+    function normalizeFeedback(value) {
+      return normalizeOrderedStore(value);
     }
     function normalizeImprovements(value) {
-      const source = value && typeof value === "object" ? value : {};
-      const rawById = source.byId && typeof source.byId === "object" ? source.byId : {};
-      const order = Array.isArray(source.order)
-        ? source.order.filter((improvementId) => typeof improvementId === "string" && rawById[improvementId]) : [];
-      return { order, byId: Object.fromEntries(order.map((improvementId) => [improvementId, rawById[improvementId]])) };
+      return normalizeOrderedStore(value);
     }
     function emptyProject(workspaceId) {
       const answers = Object.fromEntries(fields.map(({ key }) => [key, ""]));

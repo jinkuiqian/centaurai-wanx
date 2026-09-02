@@ -1,6 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import {
+  CURRENT_AGENT_PERMISSION_CONTRACT,
+  createFeedbackImprovementState,
+} from './feedback-improvement-state.mjs';
+
+export { CURRENT_AGENT_PERMISSION_CONTRACT };
 
 export const BRIEF_FIELDS = [
   ['goal', '真实任务与目标'],
@@ -15,6 +21,11 @@ export const BRIEF_FIELDS = [
 export const REQUIRED_BRIEF_FIELDS = ['goal', 'inputs', 'output', 'success'];
 export const OPTIONAL_BRIEF_FIELDS = ['examples', 'rules', 'boundaries'];
 export const FIELD_SOURCE_STATUSES = ['user_confirmed', 'inferred', 'unresolved'];
+
+const feedbackImprovementState = createFeedbackImprovementState({
+  briefFields: BRIEF_FIELDS,
+  applyBriefUpdate: updateProjectState,
+});
 
 const GUIDANCE_QUESTIONS = {
   goal: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
@@ -182,188 +193,6 @@ function recordRunFeedbackState(current, workspaceId, input, sessionId, timestam
     },
     updatedAt: timestamp,
   };
-}
-
-function planRunFeedbackChangeState(current, workspaceId, input, sessionId, timestamp, id) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)
-    || typeof input.feedbackId !== 'string' || !input.feedbackId
-    || !['implementation', 'contract'].includes(input.kind)
-    || Object.keys(input).some((key) => !['feedbackId', 'kind', 'contractPatch'].includes(key))) {
-    throw serviceError(400, 'feedback_change_invalid', '反馈修改计划无效。');
-  }
-  const feedback = current.feedback.byId[input.feedbackId];
-  const run = current.runs.byId[feedback?.runId];
-  if (!feedback || !run || feedback.verdict === 'correct') {
-    throw serviceError(409, 'feedback_change_unavailable', '只有需要修改或不可接受的反馈才能开始改进。');
-  }
-  if (run.sessionId !== sessionId) {
-    throw serviceError(403, 'feedback_change_session_mismatch', '只能在原制作会话中处理这条反馈。');
-  }
-  const open = current.improvements.order
-    .map((improvementId) => current.improvements.byId[improvementId])
-    .find((item) => ['planned', 'awaiting_confirmation'].includes(item.status));
-  if (open?.feedbackId === feedback.id && open.kind === input.kind) return current;
-  if (open) {
-    throw serviceError(409, 'feedback_change_in_progress', '请先完成当前反馈修改或工作说明决定。');
-  }
-
-  const contractPatch = input.kind === 'contract' ? validateContractPatch(input.contractPatch) : null;
-  if (input.kind === 'implementation' && input.contractPatch !== undefined) {
-    throw serviceError(400, 'feedback_change_invalid', '实现范围内的修改不能携带工作说明变更。');
-  }
-  const confirmed = current.brief.confirmedAnswers || current.brief.answers;
-  const diff = contractPatch ? BRIEF_FIELDS
-    .filter(([key]) => Object.hasOwn(contractPatch, key) && contractPatch[key] !== confirmed[key])
-    .map(([field, label]) => ({ field, label, before: confirmed[field], after: contractPatch[field] })) : [];
-  if (input.kind === 'contract' && diff.length === 0) {
-    throw serviceError(400, 'feedback_contract_diff_empty', '工作说明提案必须包含至少一项实际变化。');
-  }
-  const improvement = {
-    id,
-    workspaceId,
-    feedbackId: feedback.id,
-    sourceRunId: run.runId,
-    sourceCaseId: run.caseId,
-    sessionId,
-    kind: input.kind,
-    status: input.kind === 'contract' ? 'awaiting_confirmation' : 'planned',
-    before: {
-      agentVersion: run.agentVersion,
-      workBriefRevision: run.workBriefRevision,
-      evalRevision: run.evalRevision,
-    },
-    contractPatch,
-    diff,
-    after: null,
-    rerunId: null,
-    error: null,
-    nextAction: input.kind === 'contract'
-      ? '请成员核对工作说明差异并确认或拒绝。'
-      : '修改实现后自动运行受保护评测，并用原输入重跑。',
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-  return {
-    ...current,
-    stateVersion: current.stateVersion + 1,
-    improvements: {
-      order: [...current.improvements.order, improvement.id],
-      byId: { ...current.improvements.byId, [improvement.id]: improvement },
-    },
-    updatedAt: timestamp,
-  };
-}
-
-function decideRunFeedbackChangeState(current, input, sessionId, timestamp) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)
-    || typeof input.improvementId !== 'string' || !input.improvementId
-    || !['accept', 'reject'].includes(input.decision)
-    || Object.keys(input).some((key) => !['improvementId', 'decision'].includes(key))) {
-    throw serviceError(400, 'feedback_change_decision_invalid', '工作说明提案决定无效。');
-  }
-  const improvement = current.improvements.byId[input.improvementId];
-  if (!improvement || improvement.kind !== 'contract') {
-    throw serviceError(404, 'feedback_change_not_found', '找不到这项工作说明提案。');
-  }
-  if (improvement.sessionId !== sessionId) {
-    throw serviceError(403, 'feedback_change_session_mismatch', '只能在原制作会话中决定这项提案。');
-  }
-  if (improvement.status !== 'awaiting_confirmation') {
-    throw serviceError(409, 'feedback_change_already_decided', '这项工作说明提案已经处理。');
-  }
-  const nextImprovement = {
-    ...improvement,
-    status: input.decision === 'accept' ? 'accepted' : 'rejected',
-    nextAction: input.decision === 'accept'
-      ? '请同步并重新确认新版工作说明后再继续修改。'
-      : '继续使用当前已确认的工作说明和 Agent。',
-    updatedAt: timestamp,
-  };
-  const base = input.decision === 'accept'
-    ? updateProjectState(current, {
-      answers: improvement.contractPatch,
-      fieldSources: Object.fromEntries(Object.keys(improvement.contractPatch).map((key) => [key, {
-        status: 'user_confirmed', sourceMessageIds: [],
-      }])),
-    }, timestamp)
-    : { ...current, stateVersion: current.stateVersion + 1, updatedAt: timestamp };
-  return {
-    ...base,
-    improvements: {
-      ...base.improvements,
-      byId: { ...base.improvements.byId, [improvement.id]: nextImprovement },
-    },
-  };
-}
-
-function completeRunFeedbackChangeState(current, input, timestamp) {
-  const improvement = current.improvements.byId[input?.improvementId];
-  const rerun = current.runs.byId[input?.rerunId];
-  if (!improvement || improvement.kind !== 'implementation' || improvement.status !== 'planned'
-    || typeof input.afterAgentVersion !== 'string' || !input.afterAgentVersion
-    || !Number.isInteger(input.evalRevision) || input.evalRevision < 1
-    || !rerun || rerun.retryOf !== improvement.sourceRunId || rerun.caseId !== improvement.sourceCaseId
-    || rerun.agentVersion !== input.afterAgentVersion || rerun.evalRevision !== input.evalRevision) {
-    throw serviceError(409, 'feedback_change_completion_invalid', '反馈修改结果与原运行或新版本不匹配。');
-  }
-  const completed = {
-    ...improvement,
-    status: 'completed',
-    after: {
-      agentVersion: input.afterAgentVersion,
-      workBriefRevision: rerun.workBriefRevision,
-      evalRevision: input.evalRevision,
-    },
-    rerunId: rerun.runId,
-    error: null,
-    nextAction: rerun.status === 'passed'
-      ? '请成员核对重跑结果并提交反馈。'
-      : '根据失败证据修正后重试，不要改写验收标准。',
-    updatedAt: timestamp,
-  };
-  return replaceImprovement(current, completed, timestamp);
-}
-
-function failRunFeedbackChangeState(current, input, timestamp) {
-  const improvement = current.improvements.byId[input?.improvementId];
-  if (!improvement || improvement.kind !== 'implementation' || improvement.status !== 'planned'
-    || !input.error || typeof input.error.code !== 'string' || typeof input.error.message !== 'string') {
-    throw serviceError(409, 'feedback_change_failure_invalid', '反馈修改失败记录无效。');
-  }
-  const failed = {
-    ...improvement,
-    status: 'failed',
-    after: input.afterAgentVersion ? {
-      agentVersion: input.afterAgentVersion,
-      workBriefRevision: improvement.before.workBriefRevision,
-      evalRevision: Number.isInteger(input.evalRevision) ? input.evalRevision : improvement.before.evalRevision,
-    } : null,
-    rerunId: typeof input.rerunId === 'string' ? input.rerunId : null,
-    error: { code: input.error.code, message: input.error.message },
-    nextAction: '保留当前状态；检查失败原因后从原反馈重新开始修改。',
-    updatedAt: timestamp,
-  };
-  return replaceImprovement(current, failed, timestamp);
-}
-
-function replaceImprovement(current, improvement, timestamp) {
-  return {
-    ...current,
-    stateVersion: current.stateVersion + 1,
-    improvements: {
-      ...current.improvements,
-      byId: { ...current.improvements.byId, [improvement.id]: improvement },
-    },
-    updatedAt: timestamp,
-  };
-}
-
-function validateContractPatch(value) {
-  const patch = validateAnswerPatch(value);
-  if (Object.keys(patch).length === 0) {
-    throw serviceError(400, 'feedback_contract_diff_empty', '工作说明提案不能为空。');
-  }
-  return patch;
 }
 
 export function parseLegacyBrief(markdown, fallbackName, timestamp = new Date().toISOString()) {
@@ -946,7 +775,7 @@ export class WanxiangStateService {
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
       const current = await this.#loadState(workspace);
       assertBaseVersion(current, baseVersion);
-      const next = planRunFeedbackChangeState(
+      const next = feedbackImprovementState.plan(
         current, String(workspace.id), input, sessionId, this.now(), this.id(),
       );
       if (next !== current) await writeProjectState(workspace, next, this.dataRoot, this.id);
@@ -959,7 +788,7 @@ export class WanxiangStateService {
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
       const current = await this.#loadState(workspace);
       assertBaseVersion(current, baseVersion);
-      const next = decideRunFeedbackChangeState(current, input, sessionId, this.now());
+      const next = feedbackImprovementState.decide(current, input, sessionId, this.now());
       await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
     });
@@ -969,7 +798,7 @@ export class WanxiangStateService {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
       const current = await this.#loadState(workspace);
-      const next = completeRunFeedbackChangeState(current, input, this.now());
+      const next = feedbackImprovementState.complete(current, input, this.now());
       await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
     });
@@ -979,7 +808,7 @@ export class WanxiangStateService {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
       const current = await this.#loadState(workspace);
-      const next = failRunFeedbackChangeState(current, input, this.now());
+      const next = feedbackImprovementState.fail(current, input, this.now());
       await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
     });
@@ -1867,7 +1696,7 @@ function validateV2State(state) {
   if (!state || state.schemaVersion !== 2 || !Number.isInteger(state.stateVersion) || state.stateVersion < 1
     || typeof state.projectName !== 'string' || !state.projectName.trim() || !state.brief || !state.work
     || !isRuns(state.runs) || !isRunFeedbackStore(state.feedback, state.runs)
-    || !isFeedbackImprovementStore(state.improvements, state.feedback, state.runs)
+    || !feedbackImprovementState.isStore(state.improvements, state.feedback, state.runs)
     || !Number.isInteger(state.brief.revision) || state.brief.revision < 0
     || !isValidFieldKeyList(state.brief.deferredFields)
     || !isValidFieldKeyList(state.brief.investigatedFields)
@@ -2018,71 +1847,6 @@ function isRunFeedback(value, runs) {
     && run?.kind === 'real' && run.status !== 'running'
     && value.caseId === run.caseId && value.workBriefRevision === run.workBriefRevision
     && value.agentVersion === run.agentVersion;
-}
-
-function isFeedbackImprovementStore(value, feedbackStore, runs) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)
-    || !Array.isArray(value.order) || !value.byId || typeof value.byId !== 'object' || Array.isArray(value.byId)
-    || new Set(value.order).size !== value.order.length
-    || value.order.some((improvementId) => typeof improvementId !== 'string'
-      || !isFeedbackImprovement(value.byId[improvementId], feedbackStore, runs))
-    || Object.keys(value.byId).length !== value.order.length) return false;
-  return Object.entries(value.byId).every(([improvementId, improvement]) => improvement.id === improvementId);
-}
-
-function isFeedbackImprovement(value, feedbackStore, runs) {
-  const feedback = feedbackStore.byId[value?.feedbackId];
-  const sourceRun = runs.byId[value?.sourceRunId];
-  const rerun = value?.rerunId === null ? null : runs.byId[value?.rerunId];
-  const statuses = ['planned', 'awaiting_confirmation', 'accepted', 'rejected', 'completed', 'failed'];
-  if (!value || typeof value !== 'object' || Array.isArray(value)
-    || Object.keys(value).some((key) => ![
-      'id', 'workspaceId', 'feedbackId', 'sourceRunId', 'sourceCaseId', 'sessionId', 'kind', 'status',
-      'before', 'contractPatch', 'diff', 'after', 'rerunId', 'error', 'nextAction', 'createdAt', 'updatedAt',
-    ].includes(key))
-    || !['id', 'workspaceId', 'feedbackId', 'sourceRunId', 'sourceCaseId', 'sessionId', 'nextAction', 'createdAt', 'updatedAt']
-      .every((key) => typeof value[key] === 'string' && value[key])
-    || !['implementation', 'contract'].includes(value.kind) || !statuses.includes(value.status)
-    || !isVersionTrace(value.before)
-    || !(value.after === null || isVersionTrace(value.after))
-    || !(value.rerunId === null || typeof value.rerunId === 'string')
-    || !(value.error === null || isStructuredDispatchError(value.error))
-    || !Array.isArray(value.diff)
-    || feedback?.runId !== value.sourceRunId || feedback.verdict === 'correct'
-    || sourceRun?.caseId !== value.sourceCaseId || sourceRun.sessionId !== value.sessionId) return false;
-  if (value.kind === 'implementation') {
-    if (value.contractPatch !== null || value.diff.length !== 0) return false;
-  } else if (!value.contractPatch || !isContractPatch(value.contractPatch)
-    || value.diff.length === 0 || value.diff.some((item) => !isContractDiff(item))) return false;
-  if (value.status === 'completed') {
-    return value.after !== null && rerun?.retryOf === value.sourceRunId
-      && rerun.caseId === value.sourceCaseId && rerun.agentVersion === value.after.agentVersion
-      && rerun.evalRevision === value.after.evalRevision;
-  }
-  if (value.status === 'failed') return value.error !== null;
-  return value.after === null && value.rerunId === null && value.error === null;
-}
-
-function isVersionTrace(value) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    && typeof value.agentVersion === 'string' && value.agentVersion
-    && Number.isInteger(value.workBriefRevision) && value.workBriefRevision >= 0
-    && Number.isInteger(value.evalRevision) && value.evalRevision > 0;
-}
-
-function isContractPatch(value) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    && Object.keys(value).length > 0
-    && Object.entries(value).every(([key, item]) => (
-      BRIEF_FIELDS.some(([field]) => field === key) && typeof item === 'string'
-    ));
-}
-
-function isContractDiff(value) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    && typeof value.field === 'string' && BRIEF_FIELDS.some(([key]) => key === value.field)
-    && typeof value.label === 'string' && typeof value.before === 'string' && typeof value.after === 'string'
-    && value.before !== value.after;
 }
 
 function isStructuredDispatchError(value) {

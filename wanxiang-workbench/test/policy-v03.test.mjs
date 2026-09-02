@@ -111,12 +111,28 @@ test('work Agent generation tool derives the confirmed contract from the active 
     success: '每项待办都包含负责人和截止日期',
   };
   state.work = { sessionId: 'session-root', activeRevision: 4, activation: { status: 'active' } };
+  state.improvements = {
+    order: ['contract-improvement-1'],
+    byId: {
+      'contract-improvement-1': {
+        id: 'contract-improvement-1', feedbackId: 'feedback-contract-1',
+        kind: 'contract', status: 'accepted',
+      },
+    },
+  };
   let received;
   const evaluationCalls = [];
+  const completedChanges = [];
   const tool = createWorkAgentGenerationTool({
     async contextForAgent(actual) {
       assert.equal(actual, agent);
       return { workspaceId: 'workspace-1', workspacePath: '/managed/meeting-notes', state };
+    },
+    async completeRunFeedbackChange(workspaceId, input) {
+      completedChanges.push({ workspaceId, input });
+    },
+    async failRunFeedbackChange() {
+      assert.fail('successful contract rerun must not fail the improvement');
     },
   }, {
     async generate(project, request) {
@@ -130,6 +146,12 @@ test('work Agent generation tool derives the confirmed contract from the active 
     async execute(args, execution) {
       evaluationCalls.push({ args, execution });
       return { status: 'passed', runId: 'run-smoke-1' };
+    },
+  }, null, {
+    async retryFeedback(feedbackId, execution) {
+      assert.equal(feedbackId, 'feedback-contract-1');
+      assert.equal(execution.agent, agent);
+      return { runId: 'run-contract-after', status: 'passed' };
     },
   });
   const definition = {
@@ -162,6 +184,15 @@ test('work Agent generation tool derives the confirmed contract from the active 
   assert.equal(evaluationCalls.length, 1);
   assert.deepEqual(evaluationCalls[0].args, { caseId: 'meeting-notes-smoke-v1' });
   assert.equal(evaluationCalls[0].execution.agent, agent);
+  assert.deepEqual(completedChanges, [{
+    workspaceId: 'workspace-1',
+    input: {
+      improvementId: 'contract-improvement-1',
+      afterAgentVersion: '1.0.0',
+      rerunId: 'run-contract-after',
+      evalRevision: 2,
+    },
+  }]);
   assert.deepEqual(result, {
     ok: true,
     agentVersion: '1.0.0',
@@ -169,6 +200,7 @@ test('work Agent generation tool derives the confirmed contract from the active 
     workflowVersion: '1.0.0',
     evalRevision: 2,
     smokeCaseId: 'meeting-notes-smoke-v1',
+    feedbackRerunIds: ['run-contract-after'],
   });
 });
 
@@ -194,6 +226,50 @@ test('work Agent generation tool rejects sessions without the active confirmed w
     code: 'agent_generation_activation_required',
     statusCode: 409,
   });
+});
+
+test('work Agent generation failure records an accepted contract improvement as recoverable', async () => {
+  const agent = { id: 'session-root', session: { header: { cwd: '/managed/project' } } };
+  const state = createInitialState('项目');
+  state.brief.revision = 2;
+  state.brief.confirmedRevision = 2;
+  state.brief.confirmedAnswers = { ...state.brief.answers };
+  state.work = { sessionId: 'session-root', activeRevision: 2, activation: { status: 'active' } };
+  state.improvements = {
+    order: ['contract-improvement-1'],
+    byId: {
+      'contract-improvement-1': {
+        id: 'contract-improvement-1', feedbackId: 'feedback-contract-1',
+        kind: 'contract', status: 'accepted',
+      },
+    },
+  };
+  const failures = [];
+  const tool = createWorkAgentGenerationTool({
+    async contextForAgent() {
+      return { workspaceId: 'workspace-1', workspacePath: '/managed/project', state };
+    },
+    async failRunFeedbackChange(workspaceId, input) {
+      failures.push({ workspaceId, input });
+    },
+  }, {
+    async generate() {
+      throw Object.assign(new Error('生成事务中断'), { code: 'agent_update_interrupted' });
+    },
+  }, { async execute() { assert.fail('generation failure must not run the smoke case'); } });
+
+  await assert.rejects(tool.execute({
+    workflowSource: "process.stdout.write('{}');\n",
+    inputSchema: { type: 'object' }, outputSchema: { type: 'object' },
+    smokeCase: { id: 'smoke-1', title: '案例', input: {}, expected: {} },
+  }, { agent }), /生成事务中断/u);
+  assert.deepEqual(failures, [{
+    workspaceId: 'workspace-1',
+    input: {
+      improvementId: 'contract-improvement-1',
+      error: { code: 'agent_update_interrupted', message: '生成事务中断' },
+    },
+  }]);
 });
 
 test('work-description tool derives the project from the calling root agent and writes inferred sparse fields', async () => {
@@ -608,6 +684,21 @@ test('feedback change tool separates implementation fixes from contract proposal
   assert.deepEqual(planned[0], {
     workspaceId: 'workspace-1', baseVersion: 8,
     input: { feedbackId: 'feedback-1', kind: 'implementation' }, sessionId: 'session-root',
+  });
+
+  await tool.execute({
+    baseStateVersion: 8,
+    feedbackId: 'feedback-2',
+    kind: 'contract',
+    contractPatch: { permissions: '需要读取公开网络；外部发送仍需成员逐次确认' },
+  }, { agent });
+  assert.deepEqual(planned[1], {
+    workspaceId: 'workspace-1', baseVersion: 8,
+    input: {
+      feedbackId: 'feedback-2', kind: 'contract',
+      contractPatch: { permissions: '需要读取公开网络；外部发送仍需成员逐次确认' },
+    },
+    sessionId: 'session-root',
   });
 
   let decision;

@@ -160,6 +160,52 @@ test('a generated Agent behavior change advances its version before the next eva
   assert.deepEqual(reloaded.versions, revised.versions);
 });
 
+test('an interrupted multi-artifact Agent revision recovers from its protected transaction', async (t) => {
+  const fixture = await evaluationFixture(t);
+  await fixture.store.generate(fixture.project, {
+    projectName: '清单整理',
+    workBriefRevision: 2,
+    brief: {
+      goal: '整理待办清单', inputs: '待办 JSON', examples: '', rules: '',
+      output: '排序后的待办 JSON', boundaries: '不修改来源', success: '待办按日期排序',
+    },
+    workflowSource: "process.stdout.write(JSON.stringify({ items: [] }));\n",
+    inputSchema: { type: 'object', properties: { items: { type: 'array' } }, required: ['items'] },
+    outputSchema: { type: 'object', properties: { items: { type: 'array' } }, required: ['items'] },
+    smokeCase: { id: 'todo-smoke-v1', title: '空清单', input: { items: [] }, expected: { items: [] } },
+  });
+  const revisedSource = "process.stdout.write(JSON.stringify({ items: [], changed: true }));\n";
+  await writeFile(path.join(fixture.workspacePath, '.wanxiang', 'workflow.mjs'), revisedSource);
+  let pendingSequence = 0;
+  const interruptedStore = new EvaluationProjectStore({
+    dataRoot: fixture.dataRoot,
+    createPendingId: () => {
+      pendingSequence += 1;
+      if (pendingSequence === 5) throw Object.assign(new Error('simulated interrupted write'), { code: 'EIO' });
+      return `interrupted-${pendingSequence}`;
+    },
+  });
+
+  await assert.rejects(
+    interruptedStore.reviseGeneratedAgent(fixture.project),
+    /simulated interrupted write/u,
+  );
+
+  const recovered = await fixture.store.load(fixture.project);
+  assert.equal(recovered.agent.agentVersion, '1.0.1');
+  assert.equal(recovered.workflow.agentVersion, '1.0.1');
+  assert.equal(recovered.dataContract.agentVersion, '1.0.1');
+  assert.equal(recovered.eval.agentVersion, '1.0.1');
+  assert.equal(recovered.source, revisedSource);
+  assert.deepEqual(recovered.versions.map(({ agentVersion }) => agentVersion), ['1.0.0', '1.0.1']);
+  const transactionPath = path.join(
+    fixture.dataRoot,
+    'agent-updates',
+    `${createHash('sha256').update(fixture.project.workspaceId).digest('hex')}.json`,
+  );
+  await assert.rejects(readFile(transactionPath, 'utf8'), { code: 'ENOENT' });
+});
+
 test('generation rejects smoke inputs and expected outputs that contradict their contracts', async (t) => {
   const fixture = await evaluationFixture(t);
   const base = {

@@ -178,7 +178,10 @@ export function createWorkRunAdapter({
       const feedback = context?.state?.feedback?.byId?.[feedbackId];
       const improvement = context?.state?.improvements?.order
         ?.map((improvementId) => context.state.improvements.byId[improvementId])
-        .find((item) => item.feedbackId === feedbackId && item.kind === 'implementation' && item.status === 'planned');
+        .find((item) => item.feedbackId === feedbackId && (
+          (item.kind === 'implementation' && item.status === 'planned')
+          || (item.kind === 'contract' && item.status === 'accepted')
+        ));
       const sourceRun = context?.state?.runs?.byId?.[feedback?.runId];
       if (!improvement || !sourceRun || sourceRun.kind !== 'real' || sourceRun.status === 'running') {
         throw workRunError('feedback_retry_unavailable', '找不到可重跑的原反馈和真实案例。', 409);
