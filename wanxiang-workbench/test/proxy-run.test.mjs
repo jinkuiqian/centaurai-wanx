@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  PROXY_RUN_CASE_ID,
+  DEFAULT_PROXY_RUN_CASE_ID,
+  PROXY_RUN_CASE_IDS,
   PROXY_RUN_EVAL_REVISION,
   PROXY_RUN_TOOL_NAME,
   PROXY_RUN_WORKFLOW_NAME,
@@ -24,7 +25,7 @@ test('DSH projection folds the preset proxy-run workflow facts into current sess
       name: PROXY_RUN_WORKFLOW_NAME,
       projectId: 'project-1',
       sessionId: 'session-1',
-      caseId: PROXY_RUN_CASE_ID,
+      caseId: DEFAULT_PROXY_RUN_CASE_ID,
       workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
       evalRevision: PROXY_RUN_EVAL_REVISION,
       workBriefRevision: 7,
@@ -40,7 +41,7 @@ test('DSH projection folds the preset proxy-run workflow facts into current sess
       runId: 'run-1',
       projectId: 'project-1',
       sessionId: 'session-1',
-      caseId: PROXY_RUN_CASE_ID,
+      caseId: DEFAULT_PROXY_RUN_CASE_ID,
       workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
       evalRevision: PROXY_RUN_EVAL_REVISION,
       workBriefRevision: 7,
@@ -48,6 +49,21 @@ test('DSH projection folds the preset proxy-run workflow facts into current sess
       startedAt: '2026-09-02T10:00:00.000Z',
       completedAt: null,
       evidence: null,
+    },
+    cases: {
+      [DEFAULT_PROXY_RUN_CASE_ID]: {
+        runId: 'run-1',
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        caseId: DEFAULT_PROXY_RUN_CASE_ID,
+        workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
+        evalRevision: PROXY_RUN_EVAL_REVISION,
+        workBriefRevision: 7,
+        status: 'running',
+        startedAt: '2026-09-02T10:00:00.000Z',
+        completedAt: null,
+        evidence: null,
+      },
     },
   });
 
@@ -71,8 +87,49 @@ test('DSH projection folds the preset proxy-run workflow facts into current sess
 
   const definition = createProxyRunProjectionDefinition();
   assert.equal(definition.key, 'wanxiang.proxy-run');
-  assert.equal(definition.stateVersion, 1);
+  assert.equal(definition.stateVersion, 2);
   assert.deepEqual(definition.wire.view(definition.stateSchema.parse(passed)), passed);
+});
+
+test('DSH projection retains each visible customer follow-up case status and evidence', () => {
+  let state = initialProxyRunProjection();
+  for (const [index, caseId] of PROXY_RUN_CASE_IDS.entries()) {
+    const runId = `run-${index + 1}`;
+    state = applyProxyRunEvent(state, {
+      type: 'tool-workflow/run-start',
+      data: {
+        runId,
+        name: PROXY_RUN_WORKFLOW_NAME,
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        caseId,
+        workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
+        evalRevision: PROXY_RUN_EVAL_REVISION,
+        workBriefRevision: 7,
+        startedAt: '2026-09-02T10:00:00.000Z',
+      },
+    });
+    state = applyProxyRunEvent(state, {
+      type: 'tool-workflow/run-end',
+      data: {
+        runId,
+        status: 'passed',
+        completedAt: '2026-09-02T10:00:01.000Z',
+        evidence: {
+          summary: '代理运行通过',
+          assertions: [{ id: 'structured-missing-follow-ups', passed: true }],
+          output: { missingFollowUps: [] },
+        },
+      },
+    });
+  }
+
+  assert.equal(state.runCount, 5);
+  assert.deepEqual(Object.keys(state.cases), PROXY_RUN_CASE_IDS);
+  for (const caseId of PROXY_RUN_CASE_IDS) {
+    assert.equal(state.cases[caseId].status, 'passed');
+    assert.deepEqual(state.cases[caseId].evidence.output, { missingFollowUps: [] });
+  }
 });
 
 test('proxy-run tool adapter executes one deterministic synthetic case outside the Host and records durable DSH facts', async () => {
@@ -100,7 +157,8 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
           value: {
             status: 'passed',
             summary: '代理运行通过',
-            assertions: [{ id: 'stable-output', passed: true }],
+            assertions: [{ id: 'structured-missing-follow-ups', passed: true }],
+            output: { reportMarkdown: '# 客户跟进代理周报', missingFollowUps: [] },
           },
           stopReason: 'completed',
           agentsStarted: 0,
@@ -129,9 +187,12 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
           eval: {
             revision: 3,
             cases: [{
-              id: PROXY_RUN_CASE_ID,
-              input: { title: '客户跟进清单' },
-              expected: { title: '客户跟进清单', itemCount: 2, labels: ['已安排', '待回复'] },
+              id: DEFAULT_PROXY_RUN_CASE_ID,
+              input: { asOf: '2026-09-01', customersCsv: 'customer_id,name', communicationsJson: '[]' },
+              expected: {
+                missingFollowUps: [],
+                markdown: { requiredSections: ['# 客户跟进代理周报'], customerReferences: [], evidenceReferences: [] },
+              },
             }],
           },
         };
@@ -140,7 +201,7 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
     runner: {
       async run(request) {
         runRequests.push(request);
-        return { title: '客户跟进清单', itemCount: 2, labels: ['已安排', '待回复'] };
+        return { reportMarkdown: '# 客户跟进代理周报', missingFollowUps: [] };
       },
     },
     workflowEngine,
@@ -151,11 +212,11 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   });
 
   assert.equal(tool.name, PROXY_RUN_TOOL_NAME);
-  const output = await tool.execute({ caseId: PROXY_RUN_CASE_ID }, { agent, signal: new AbortController().signal });
+  const output = await tool.execute({ caseId: DEFAULT_PROXY_RUN_CASE_ID }, { agent, signal: new AbortController().signal });
 
   assert.equal(workflowRequest.parent, agent);
   assert.equal(workflowRequest.meta.name, PROXY_RUN_WORKFLOW_NAME);
-  assert.equal(workflowRequest.args.caseId, PROXY_RUN_CASE_ID);
+  assert.equal(workflowRequest.args.caseId, DEFAULT_PROXY_RUN_CASE_ID);
   assert.equal(workflowRequest.maxTotalAgents, 1);
   assert.match(workflowRequest.script, /return \{/u);
   assert.doesNotMatch(workflowRequest.script, /readFile|import\(|require\(/u);
@@ -167,7 +228,7 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
     name: PROXY_RUN_WORKFLOW_NAME,
     projectId: 'project-1',
     sessionId: 'session-1',
-    caseId: PROXY_RUN_CASE_ID,
+    caseId: DEFAULT_PROXY_RUN_CASE_ID,
     workflowVersion: '2.0.0',
     evalRevision: 3,
     workBriefRevision: 7,
@@ -184,8 +245,11 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   assert.equal(saved[0].workBriefRevision, 7);
   assert.equal(output.status, 'passed');
   assert.equal(output.runId, 'run-unique-1');
+  assert.deepEqual(output.output, { reportMarkdown: '# 客户跟进代理周报', missingFollowUps: [] });
   assert.equal(runRequests[0].entrypoint, 'workflow.mjs');
-  assert.deepEqual(runRequests[0].input, { title: '客户跟进清单' });
+  assert.deepEqual(runRequests[0].input, {
+    asOf: '2026-09-01', customersCsv: 'customer_id,name', communicationsJson: '[]',
+  });
 });
 
 test('runner failures become structured evidence and a terminal fact in the same DSH session', async () => {
@@ -246,7 +310,7 @@ test('proxy-run evidence is persisted outside project code under stable run iden
     workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
     evalRevision: PROXY_RUN_EVAL_REVISION,
     workBriefRevision: 7,
-    caseId: PROXY_RUN_CASE_ID,
+    caseId: DEFAULT_PROXY_RUN_CASE_ID,
     status: 'passed',
     startedAt: '2026-09-02T10:00:00.000Z',
     completedAt: '2026-09-02T10:00:01.000Z',

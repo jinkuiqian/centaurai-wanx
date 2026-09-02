@@ -1,13 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { PROXY_RUN_CASE_ID } from './evaluation-state.mjs';
+import { DEFAULT_PROXY_RUN_CASE_ID, PROXY_RUN_CASE_IDS } from './evaluation-state.mjs';
 
 export const PROXY_RUN_TOOL_NAME = 'wanxiang_run_evaluation';
 export const PROXY_RUN_EVAL_REVISION = 1;
 export const PROXY_RUN_WORKFLOW_NAME = 'wanxiang-preset-proxy-run';
-export const PROXY_RUN_WORKFLOW_VERSION = '1.0.0';
-export { PROXY_RUN_CASE_ID };
+export const PROXY_RUN_WORKFLOW_VERSION = '2.0.0';
+export { DEFAULT_PROXY_RUN_CASE_ID, PROXY_RUN_CASE_IDS };
 
 const PROXY_RUN_SCRIPT = `const stable = (value) => {
   if (Array.isArray(value)) return value.map(stable);
@@ -18,10 +18,16 @@ const PROXY_RUN_SCRIPT = `const stable = (value) => {
 };
 const expected = args.expected;
 const actual = args.actual;
-const assertions = Object.keys(expected).sort().map((key) => ({
-  id: "expected-" + key,
-  passed: JSON.stringify(stable(actual[key])) === JSON.stringify(stable(expected[key])),
-}));
+const assertions = [{
+  id: "structured-missing-follow-ups",
+  passed: JSON.stringify(stable(actual.missingFollowUps)) === JSON.stringify(stable(expected.missingFollowUps)),
+}];
+for (const [group, fragments] of Object.entries(expected.markdown)) {
+  fragments.forEach((fragment, index) => assertions.push({
+    id: "markdown-" + group + "-" + index,
+    passed: typeof actual.reportMarkdown === "string" && actual.reportMarkdown.includes(fragment),
+  }));
+}
 const passed = assertions.every((item) => item.passed);
 return {
   status: passed ? "passed" : "failed",
@@ -31,53 +37,63 @@ return {
 };`;
 
 const PRESET_INPUT = Object.freeze({
-  caseId: PROXY_RUN_CASE_ID,
-  fixture: {
-    title: '客户跟进清单',
-    items: [{ label: '待回复' }, { label: '已安排' }],
+  caseId: DEFAULT_PROXY_RUN_CASE_ID,
+  actual: {
+    reportMarkdown: '# 客户跟进代理周报\n\n## 本周概览\n\n安行科技\n\n## 漏跟进客户\n\n- 无\n\n证据：2026-08-28，林岚',
+    missingFollowUps: [],
   },
   expected: {
-    title: '客户跟进清单',
-    itemCount: 2,
-    labels: ['已安排', '待回复'],
+    missingFollowUps: [],
+    markdown: {
+      requiredSections: ['# 客户跟进代理周报', '## 本周概览', '## 漏跟进客户'],
+      customerReferences: ['安行科技'],
+      evidenceReferences: ['2026-08-28', '林岚'],
+    },
   },
 });
 
 export function initialProxyRunProjection() {
-  return { status: 'idle', runCount: 0, latest: null };
+  return { status: 'idle', runCount: 0, latest: null, cases: {} };
 }
 
 export function applyProxyRunEvent(state, event) {
   if (event?.type === 'tool-workflow/run-start' && event.data?.name === PROXY_RUN_WORKFLOW_NAME) {
     const data = event.data;
+    const latest = {
+      runId: data.runId,
+      projectId: data.projectId,
+      sessionId: data.sessionId,
+      caseId: data.caseId,
+      workflowVersion: data.workflowVersion,
+      evalRevision: data.evalRevision,
+      workBriefRevision: data.workBriefRevision,
+      status: 'running',
+      startedAt: data.startedAt,
+      completedAt: null,
+      evidence: null,
+    };
     return {
       status: 'running',
       runCount: state.runCount + 1,
-      latest: {
-        runId: data.runId,
-        projectId: data.projectId,
-        sessionId: data.sessionId,
-        caseId: data.caseId,
-        workflowVersion: data.workflowVersion,
-        evalRevision: data.evalRevision,
-        workBriefRevision: data.workBriefRevision,
-        status: 'running',
-        startedAt: data.startedAt,
-        completedAt: null,
-        evidence: null,
-      },
+      latest,
+      cases: { ...state.cases, [data.caseId]: latest },
     };
   }
-  if (event?.type !== 'tool-workflow/run-end' || event.data?.runId !== state.latest?.runId) return state;
+  if (event?.type !== 'tool-workflow/run-end') return state;
+  const caseId = Object.keys(state.cases).find((id) => state.cases[id].runId === event.data?.runId);
+  if (!caseId) return state;
+  const completed = {
+    ...state.cases[caseId],
+    status: event.data.status,
+    completedAt: event.data.completedAt,
+    evidence: event.data.evidence,
+  };
+  const isLatest = event.data.runId === state.latest?.runId;
   return {
     ...state,
-    status: event.data.status,
-    latest: {
-      ...state.latest,
-      status: event.data.status,
-      completedAt: event.data.completedAt,
-      evidence: event.data.evidence,
-    },
+    status: isLatest ? event.data.status : state.status,
+    latest: isLatest ? completed : state.latest,
+    cases: { ...state.cases, [caseId]: completed },
   };
 }
 
@@ -86,7 +102,7 @@ export function createProxyRunProjectionDefinition() {
   return {
     key: 'wanxiang.proxy-run',
     stateSchema: schema,
-    stateVersion: 1,
+    stateVersion: 2,
     init: initialProxyRunProjection,
     apply: applyProxyRunEvent,
     wire: {
@@ -115,18 +131,17 @@ export class RunEvidenceStore {
 }
 
 export function createPresetProxyRunWorkflowRequest(parent, signal) {
-  const actual = {
-    title: PRESET_INPUT.fixture.title,
-    itemCount: PRESET_INPUT.fixture.items.length,
-    labels: PRESET_INPUT.fixture.items.map((item) => item.label).sort(),
-  };
   return {
     script: PROXY_RUN_SCRIPT,
     meta: {
       name: PROXY_RUN_WORKFLOW_NAME,
       description: 'Run Wanxiang\'s deterministic preset proxy run over synthetic material.',
     },
-    args: { caseId: PROXY_RUN_CASE_ID, actual, expected: structuredClone(PRESET_INPUT.expected) },
+    args: {
+      caseId: DEFAULT_PROXY_RUN_CASE_ID,
+      actual: structuredClone(PRESET_INPUT.actual),
+      expected: structuredClone(PRESET_INPUT.expected),
+    },
     parent,
     signal,
   };
@@ -284,6 +299,7 @@ function evaluationEvidence({ runId, context, sessionId, evaluation, evalCase, s
     completedAt,
     summary: value.summary,
     assertions: value.assertions,
+    ...(value.output ? { output: value.output } : {}),
     ...(value.error ? { error: value.error } : {}),
   };
 }
@@ -298,6 +314,7 @@ async function recordEvaluationResult(session, evidenceStore, flushSession, evid
     evidence: {
       summary: evidence.summary,
       assertions: evidence.assertions,
+      ...(evidence.output ? { output: evidence.output } : {}),
       ...(evidence.error ? { error: evidence.error } : {}),
     },
   });
@@ -320,11 +337,15 @@ function normalizeProxyRunValue(result) {
     ? value.assertions.filter((item) => item && typeof item.id === 'string' && typeof item.passed === 'boolean')
       .map((item) => ({ id: item.id, passed: item.passed }))
     : [];
-  const passed = value.status === 'passed' && assertions.length > 0 && assertions.every((item) => item.passed);
+  const output = value.output && typeof value.output === 'object' && !Array.isArray(value.output)
+    ? structuredClone(value.output)
+    : null;
+  const passed = value.status === 'passed' && assertions.length > 0 && assertions.every((item) => item.passed) && output;
   return {
     status: passed ? 'passed' : 'failed',
     summary: typeof value.summary === 'string' && value.summary ? value.summary : passed ? '代理运行通过' : '代理运行未通过',
     assertions,
+    ...(output ? { output } : {}),
   };
 }
 
@@ -334,7 +355,8 @@ function proxyRunProjectionSchema() {
       if (!value || typeof value !== 'object' || Array.isArray(value)
         || !['idle', 'running', 'passed', 'failed'].includes(value.status)
         || !Number.isSafeInteger(value.runCount) || value.runCount < 0
-        || (value.latest !== null && (typeof value.latest !== 'object' || Array.isArray(value.latest)))) {
+        || (value.latest !== null && (typeof value.latest !== 'object' || Array.isArray(value.latest)))
+        || !value.cases || typeof value.cases !== 'object' || Array.isArray(value.cases)) {
         throw new Error('invalid Wanxiang proxy-run projection');
       }
       return value;

@@ -8,7 +8,7 @@ import SessionStore from '@deepseek-ai/dsh-session';
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection';
 import WorkerThreadWorkflowEngine from '@deepseek-ai/dsh-workflow-worker-thread';
 import {
-  PROXY_RUN_CASE_ID,
+  DEFAULT_PROXY_RUN_CASE_ID,
   PROXY_RUN_EVAL_REVISION,
   PROXY_RUN_WORKFLOW_NAME,
   PROXY_RUN_WORKFLOW_VERSION,
@@ -69,7 +69,7 @@ test('real DSH session projection registry folds durable run facts into one curr
     name: PROXY_RUN_WORKFLOW_NAME,
     projectId: 'project-contract',
     sessionId: session.id,
-    caseId: PROXY_RUN_CASE_ID,
+    caseId: DEFAULT_PROXY_RUN_CASE_ID,
     workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
     evalRevision: PROXY_RUN_EVAL_REVISION,
     workBriefRevision: 3,
@@ -93,6 +93,53 @@ test('real DSH session projection registry folds durable run facts into one curr
   assert.equal(snapshot.values['wanxiang.proxy-run'].latest.sessionId, session.id);
 });
 
+test('customer follow-up proxy slice runs all five protected cases with stable structured judgments', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'wanxiang-follow-up-contract-'));
+  const workspacePath = path.join(root, 'workspace');
+  const dataRoot = path.join(root, 'data');
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const ctx = new Context();
+  await ctx.plugin(NoopSubagents);
+  await ctx.plugin(WorkerThreadWorkflowEngine, { provider: 'spawn', disposeGraceMs: 1_000 });
+  t.after(() => ctx.fiber.dispose());
+  const evaluationStore = new EvaluationProjectStore({ dataRoot });
+  const evaluation = await evaluationStore.load({ workspaceId: 'project-1', workspacePath });
+  const agent = {
+    id: 'session-contract',
+    session: { header: { cwd: workspacePath }, append() {} },
+  };
+  const state = { brief: { revision: 4 }, work: { sessionId: agent.id, activeRevision: 4 } };
+  let nextRunId = 0;
+  const tool = createProxyRunToolAdapter({
+    projectService: { async contextForAgent() { return { workspaceId: 'project-1', workspacePath, state }; } },
+    evaluationStore,
+    runner: new RestrictedWorkflowRunner(),
+    workflowEngine: ctx.workflowEngine,
+    evidenceStore: { async save() {} },
+    flushSession: async () => {},
+    createRunId: () => `follow-up-run-${++nextRunId}`,
+    now: () => '2026-09-02T10:00:00.000Z',
+  });
+
+  const firstPass = [];
+  for (const evalCase of evaluation.eval.cases) {
+    const result = await tool.execute({ caseId: evalCase.id }, { agent, signal: new AbortController().signal });
+    assert.equal(result.status, 'passed', evalCase.title);
+    assert.deepEqual(result.output.missingFollowUps, evalCase.expected.missingFollowUps);
+    for (const fragment of Object.values(evalCase.expected.markdown).flat()) {
+      assert.match(result.output.reportMarkdown, new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'));
+    }
+    firstPass.push(result.output.missingFollowUps);
+  }
+
+  const secondPass = [];
+  for (const evalCase of evaluation.eval.cases) {
+    const result = await tool.execute({ caseId: evalCase.id }, { agent, signal: new AbortController().signal });
+    secondPass.push(result.output.missingFollowUps);
+  }
+  assert.deepEqual(secondPass, firstPass);
+});
+
 test('the evaluation tool reruns an Agent-modified Workflow against the same protected Eval', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'wanxiang-tool-contract-'));
   const workspacePath = path.join(root, 'workspace');
@@ -107,15 +154,12 @@ test('the evaluation tool reruns an Agent-modified Workflow against the same pro
   const manifestPath = path.join(workspacePath, '.wanxiang', 'workflow.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
   await writeFile(manifestPath, `${JSON.stringify({ ...manifest, workflowVersion: '1.1.0' }, null, 2)}\n`);
-  await writeFile(path.join(workspacePath, '.wanxiang', 'workflow.mjs'), `
-let body = '';
-process.stdin.setEncoding('utf8');
-for await (const chunk of process.stdin) body += chunk;
-const input = JSON.parse(body);
-const labels = input.items.map(({ label }) => label);
-labels.sort();
-process.stdout.write(JSON.stringify({ title: input.title, itemCount: labels.length, labels }));
-`);
+  const workflowPath = path.join(workspacePath, '.wanxiang', 'workflow.mjs');
+  const source = await readFile(workflowPath, 'utf8');
+  await writeFile(workflowPath, source.replace(
+    'const output = { reportMarkdown:',
+    "lines.unshift('由 Agent 修改的 Workflow');\nconst output = { reportMarkdown:",
+  ));
   const events = [];
   const agent = {
     id: 'session-contract',
@@ -133,11 +177,12 @@ process.stdout.write(JSON.stringify({ title: input.title, itemCount: labels.leng
     createRunId: () => 'modified-run',
   });
 
-  const result = await tool.execute({ caseId: PROXY_RUN_CASE_ID }, { agent, signal: new AbortController().signal });
+  const result = await tool.execute({ caseId: DEFAULT_PROXY_RUN_CASE_ID }, { agent, signal: new AbortController().signal });
 
   assert.equal(result.status, 'passed');
   assert.equal(result.workflowVersion, '1.1.0');
   assert.equal(result.evalRevision, 1);
+  assert.match(result.output.reportMarkdown, /^由 Agent 修改的 Workflow/u);
   assert.deepEqual(events.map((event) => event.type), ['tool-workflow/run-start', 'tool-workflow/run-end']);
   assert.equal(evidence[0].runId, 'modified-run');
 });

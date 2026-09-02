@@ -52,7 +52,7 @@ test('workbench composition registers the proxy-run tool adapter and DSH project
   assert.ok(inject.includes('workflowEngine'));
   assert.ok(inject.includes('sessionProjections'));
   assert.equal(registeredTools.get('wanxiang_run_evaluation')?.name, 'wanxiang_run_evaluation');
-  assert.equal(projections.get('wanxiang.proxy-run')?.stateVersion, 1);
+  assert.equal(projections.get('wanxiang.proxy-run')?.stateVersion, 2);
 });
 
 test('work-description tool derives the project from the calling root agent and writes inferred sparse fields', async () => {

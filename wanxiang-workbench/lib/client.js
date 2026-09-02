@@ -25,6 +25,13 @@ window.__ModuleLoader__.load({
     const fieldKeys = new Set(fields.map((field) => field.key));
     const fieldByKey = Object.fromEntries(fields.map((field) => [field.key, field]));
     const sourceLabels = { user_confirmed: "用户确认", inferred: "根据案例推断", unresolved: "待确认" };
+    const proxyRunCaseLabels = {
+      "customer-follow-up-normal-v1": "正常客户",
+      "customer-follow-up-overdue-v1": "超过 14 天未跟进",
+      "customer-follow-up-no-communication-v1": "无沟通记录",
+      "customer-follow-up-high-intent-no-next-step-v1": "高意向但无下一步",
+      "customer-follow-up-missing-owner-v1": "缺少负责人",
+    };
     const guidanceQuestions = {
       goal: "这项工作现在怎么做，最想解决哪个具体问题？",
       inputs: "可以提供一份真实材料，或说明资料来自哪里吗？",
@@ -943,6 +950,14 @@ window.__ModuleLoader__.load({
         return Object.keys(patch.answers || patch).filter((key) => fieldKeys.has(key));
       } catch { return []; }
     }
+    function proxyRunCase(block) {
+      const call = "kind" in block ? block.call : block;
+      if (!call?.argsRaw) return "代表案例";
+      try {
+        const caseId = JSON.parse(call.argsRaw).caseId;
+        return proxyRunCaseLabels[caseId] || caseId || "代表案例";
+      } catch { return "代表案例"; }
+    }
     function ToolStatusView({ state, copy, inspect, inspectLabel }) {
       return h("div", { className: "wx-tool-brief", "data-state": state, role: state === "error" ? "alert" : "status", "aria-live": "polite" },
         h("span", { className: "wx-tool-icon", "aria-hidden": "true" }, state === "ok" ? h(Icon, { name: "check", size: 13 }) : h(Icon, { name: "brief", size: 13 })),
@@ -971,9 +986,10 @@ window.__ModuleLoader__.load({
     function ProxyRunToolView({ block, inspect }) {
       const done = "kind" in block;
       const state = !done ? "running" : block.isError ? "error" : "ok";
-      const copy = state === "running" ? "代理运行中 · 预置合成材料"
-        : state === "error" ? "代理运行未通过"
-          : "代理运行通过";
+      const caseTitle = proxyRunCase(block);
+      const copy = state === "running" ? `代理垂直切片 · ${caseTitle} · 代理运行中`
+        : state === "error" ? `代理垂直切片 · ${caseTitle} · 未通过`
+          : `代理垂直切片 · ${caseTitle} · 代理运行通过`;
       return h(ToolStatusView, { state, copy, inspect, inspectLabel: "查看运行证据" });
     }
 

@@ -33,6 +33,16 @@ test('v0.3.2 shows the proxy run and pass result in the existing DSH tool view',
   assert.doesNotMatch(client, /slots\.inject\("conversation\.view"[\s\S]*ProxyRun/u);
 });
 
+test('v0.3.3 identifies all five proxy-slice cases in the native tool timeline', () => {
+  assert.match(client, /function ProxyRunToolView\(\{ block, inspect \}\)[\s\S]*proxyRunCase\(block\)/u);
+  for (const title of ['正常客户', '超过 14 天未跟进', '无沟通记录', '高意向但无下一步', '缺少负责人']) {
+    assert.match(client, new RegExp(title, 'u'));
+  }
+  assert.match(client, /代理垂直切片/u);
+  assert.match(client, /caseTitle/u);
+  assert.match(client, /查看运行证据/u);
+});
+
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {
   assert.match(client, /function GuidanceDock\(\{ session, sessionId, input, inputActions \}\)/u);
   assert.match(client, /inputActions\.setDraft\(example\.draft\)/u);
