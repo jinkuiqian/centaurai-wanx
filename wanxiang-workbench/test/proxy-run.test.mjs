@@ -45,9 +45,11 @@ test('DSH projection folds the preset proxy-run workflow facts into current sess
       workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
       evalRevision: PROXY_RUN_EVAL_REVISION,
       workBriefRevision: 7,
+      retryOf: null,
       status: 'running',
       startedAt: '2026-09-02T10:00:00.000Z',
       completedAt: null,
+      conclusion: null,
       evidence: null,
     },
     cases: {
@@ -59,9 +61,28 @@ test('DSH projection folds the preset proxy-run workflow facts into current sess
         workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
         evalRevision: PROXY_RUN_EVAL_REVISION,
         workBriefRevision: 7,
+        retryOf: null,
         status: 'running',
         startedAt: '2026-09-02T10:00:00.000Z',
         completedAt: null,
+        conclusion: null,
+        evidence: null,
+      },
+    },
+    runs: {
+      'run-1': {
+        runId: 'run-1',
+        projectId: 'project-1',
+        sessionId: 'session-1',
+        caseId: DEFAULT_PROXY_RUN_CASE_ID,
+        workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
+        evalRevision: PROXY_RUN_EVAL_REVISION,
+        workBriefRevision: 7,
+        retryOf: null,
+        status: 'running',
+        startedAt: '2026-09-02T10:00:00.000Z',
+        completedAt: null,
+        conclusion: null,
         evidence: null,
       },
     },
@@ -87,8 +108,45 @@ test('DSH projection folds the preset proxy-run workflow facts into current sess
 
   const definition = createProxyRunProjectionDefinition();
   assert.equal(definition.key, 'wanxiang.proxy-run');
-  assert.equal(definition.stateVersion, 2);
+  assert.equal(definition.stateVersion, 3);
   assert.deepEqual(definition.wire.view(definition.stateSchema.parse(passed)), passed);
+});
+
+test('DSH projection preserves attempts, explicit conclusions and retry lineage without conflicting final states', () => {
+  const start = (runId, caseId, retryOf = null) => ({
+    type: 'tool-workflow/run-start',
+    data: {
+      runId, retryOf, name: PROXY_RUN_WORKFLOW_NAME, projectId: 'project-1', sessionId: 'session-1', caseId,
+      workflowVersion: PROXY_RUN_WORKFLOW_VERSION, evalRevision: 1, workBriefRevision: 7,
+      startedAt: `2026-09-02T10:0${runId.at(-1)}:00.000Z`,
+    },
+  });
+  const end = (runId, status, conclusion, evidence) => ({
+    type: 'tool-workflow/run-end',
+    data: { runId, status, conclusion, completedAt: '2026-09-02T10:10:00.000Z', evidence },
+  });
+  let state = initialProxyRunProjection();
+  state = applyProxyRunEvent(state, start('run-1', PROXY_RUN_CASE_IDS[0]));
+  state = applyProxyRunEvent(state, end('run-1', 'passed', 'passed', { summary: '通过', assertions: [{ id: 'a', passed: true }] }));
+  state = applyProxyRunEvent(state, start('run-2', PROXY_RUN_CASE_IDS[1]));
+  state = applyProxyRunEvent(state, end('run-2', 'failed', 'timed_out', {
+    summary: '超时', assertions: [], error: { code: 'workflow_timeout', message: '超时' },
+  }));
+  state = applyProxyRunEvent(state, start('run-3', PROXY_RUN_CASE_IDS[1], 'run-2'));
+  state = applyProxyRunEvent(state, end('run-3', 'cancelled', 'cancelled', {
+    summary: '已取消', assertions: [], error: { code: 'workflow_cancelled', message: '已取消' },
+  }));
+
+  assert.equal(state.runCount, 3);
+  assert.equal(state.runs['run-1'].status, 'passed');
+  assert.equal(state.runs['run-2'].conclusion, 'timed_out');
+  assert.equal(state.runs['run-3'].retryOf, 'run-2');
+  assert.equal(state.runs['run-3'].status, 'cancelled');
+  assert.equal(state.cases[PROXY_RUN_CASE_IDS[0]].status, 'passed');
+  assert.equal(state.cases[PROXY_RUN_CASE_IDS[1]].runId, 'run-3');
+
+  const conflicting = applyProxyRunEvent(state, end('run-3', 'passed', 'passed', { summary: '矛盾通过', assertions: [] }));
+  assert.equal(conflicting, state);
 });
 
 test('DSH projection retains each visible customer follow-up case status and evidence', () => {
@@ -169,6 +227,7 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
     },
   };
   const saved = [];
+  const projectRuns = [];
   let flushes = 0;
   const runRequests = [];
   const tool = createProxyRunToolAdapter({
@@ -177,6 +236,8 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
         assert.equal(actual, agent);
         return { workspaceId: 'project-1', workspacePath: '/managed/project', state };
       },
+      async startEvaluationRun(projectId, value) { projectRuns.push({ phase: 'start', projectId, value }); },
+      async finishEvaluationRun(projectId, value) { projectRuns.push({ phase: 'finish', projectId, value }); },
     },
     evaluationStore: {
       async load(project) {
@@ -232,6 +293,7 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
     workflowVersion: '2.0.0',
     evalRevision: 3,
     workBriefRevision: 7,
+    retryOf: null,
     startedAt: '2026-09-02T10:00:00.000Z',
   });
   assert.equal(events[1].data.runId, 'run-unique-1');
@@ -243,6 +305,10 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   assert.equal(saved[0].workflowVersion, '2.0.0');
   assert.equal(saved[0].evalRevision, 3);
   assert.equal(saved[0].workBriefRevision, 7);
+  assert.deepEqual(projectRuns.map((item) => [item.phase, item.projectId, item.value.runId]), [
+    ['start', 'project-1', 'run-unique-1'],
+    ['finish', 'project-1', 'run-unique-1'],
+  ]);
   assert.equal(output.status, 'passed');
   assert.equal(output.runId, 'run-unique-1');
   assert.deepEqual(output.output, { reportMarkdown: '# 客户跟进代理周报', missingFollowUps: [] });
@@ -267,6 +333,8 @@ test('runner failures become structured evidence and a terminal fact in the same
           state: { brief: { revision: 7 }, work: { sessionId: 'session-1', activeRevision: 7 } },
         };
       },
+      async startEvaluationRun() {},
+      async finishEvaluationRun() {},
     },
     evaluationStore: {
       async load() {
@@ -294,9 +362,71 @@ test('runner failures become structured evidence and a terminal fact in the same
 
   assert.deepEqual(events.map((event) => event.type), ['tool-workflow/run-start', 'tool-workflow/run-end']);
   assert.equal(events[1].data.status, 'failed');
+  assert.equal(events[1].data.conclusion, 'timed_out');
   assert.equal(events[1].data.evidence.error.code, 'workflow_timeout');
   assert.equal(saved[0].status, 'failed');
   assert.equal(saved[0].error.code, 'workflow_timeout');
+});
+
+test('cancelled retries keep a new runId, link the prior attempt and finalize project and DSH facts consistently', async () => {
+  const caseId = 'cancel-case-v1';
+  const events = [];
+  const projectStarts = [];
+  const projectEnds = [];
+  const session = { header: {}, append(type, data) { events.push({ type, data: structuredClone(data) }); } };
+  const agent = { id: 'session-1', session };
+  const projectService = {
+    async contextForAgent() {
+      return {
+        workspaceId: 'project-1', workspacePath: '/managed/project',
+        state: { brief: { revision: 7 }, work: { sessionId: 'session-1', activeRevision: 7 } },
+      };
+    },
+    async startEvaluationRun(projectId, value) { projectStarts.push({ projectId, value: structuredClone(value) }); },
+    async finishEvaluationRun(projectId, value) { projectEnds.push({ projectId, value: structuredClone(value) }); },
+  };
+  const tool = createProxyRunToolAdapter({
+    projectService,
+    evaluationStore: {
+      async load() {
+        return {
+          workflow: { workflowVersion: '2.0.0', entrypoint: 'workflow.mjs' }, source: 'source',
+          eval: { revision: 3, cases: [{ id: caseId, input: {}, expected: {} }] },
+        };
+      },
+    },
+    runner: {
+      async run() { throw Object.assign(new Error('用户已取消代理运行。'), { code: 'workflow_cancelled' }); },
+    },
+    workflowEngine: { start() { assert.fail('cancelled execution must not reach assertions'); } },
+    evidenceStore: { async save() {} },
+    flushSession: async () => {},
+    createRunId: () => 'run-retry-2',
+    now: sequenceClock('2026-09-02T10:00:00.000Z', '2026-09-02T10:00:01.000Z'),
+  });
+
+  await assert.rejects(
+    tool.execute({ caseId, retryOf: 'run-failed-1' }, { agent, signal: new AbortController().signal }),
+    (error) => error.code === 'workflow_cancelled',
+  );
+
+  assert.equal(projectStarts[0].projectId, 'project-1');
+  assert.equal(projectStarts[0].value.runId, 'run-retry-2');
+  assert.equal(projectStarts[0].value.retryOf, 'run-failed-1');
+  assert.deepEqual(projectEnds[0].value, {
+    runId: 'run-retry-2',
+    status: 'cancelled',
+    conclusion: 'cancelled',
+    completedAt: '2026-09-02T10:00:01.000Z',
+    evidence: {
+      summary: '用户已取消代理运行。',
+      assertions: [],
+      error: { code: 'workflow_cancelled', message: '用户已取消代理运行。' },
+    },
+  });
+  assert.equal(events[0].data.retryOf, 'run-failed-1');
+  assert.equal(events[1].data.status, 'cancelled');
+  assert.equal(events[1].data.conclusion, 'cancelled');
 });
 
 test('proxy-run evidence is persisted outside project code under stable run identity', async (t) => {
@@ -323,6 +453,11 @@ test('proxy-run evidence is persisted outside project code under stable run iden
   assert.ok(filename.startsWith(path.join(dataRoot, 'proxy-run-evidence')));
   assert.deepEqual(JSON.parse(await readFile(filename, 'utf8')), evidence);
   assert.doesNotMatch(path.relative(dataRoot, filename), /run\/unsafe|project\/unsafe/u);
+
+  await assert.rejects(store.save({ ...evidence, status: 'failed', summary: '冲突结论' }), {
+    code: 'evaluation_run_id_conflict',
+  });
+  assert.deepEqual(JSON.parse(await readFile(filename, 'utf8')), evidence);
 });
 
 function sequenceClock(...values) {

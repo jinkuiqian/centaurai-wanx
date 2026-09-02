@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Context, Service } from '@deepseek-ai/cordis';
@@ -12,11 +12,13 @@ import {
   PROXY_RUN_EVAL_REVISION,
   PROXY_RUN_WORKFLOW_NAME,
   PROXY_RUN_WORKFLOW_VERSION,
+  RunEvidenceStore,
   createProxyRunProjectionDefinition,
   createProxyRunToolAdapter,
   createPresetProxyRunWorkflowRequest,
 } from '../../wanxiang-workbench/src/proxy-run.mjs';
 import { EvaluationProjectStore } from '../../wanxiang-workbench/src/evaluation-state.mjs';
+import { WanxiangStateService } from '../../wanxiang-workbench/src/project-state.mjs';
 import { RestrictedWorkflowRunner } from '../../wanxiang-workbench/src/restricted-runner.mjs';
 
 class NoopSubagents extends Service {
@@ -93,6 +95,65 @@ test('real DSH session projection registry folds durable run facts into one curr
   assert.equal(snapshot.values['wanxiang.proxy-run'].latest.sessionId, session.id);
 });
 
+test('one runId cross-locates protected project state, immutable evidence and real DSH session facts', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'wanxiang-run-lineage-contract-'));
+  const workspacePath = path.join(root, 'workspace');
+  const dataRoot = path.join(root, 'data');
+  await mkdir(workspacePath, { recursive: true });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = { id: 'project-lineage', path: workspacePath, title: '谱系项目', sessionIds: [] };
+  const registry = {
+    get(id) { return id === workspace.id ? workspace : undefined; },
+    list() { return [workspace]; },
+    async resolveByPath(value) { return value === workspacePath ? workspace : undefined; },
+  };
+  const projectState = new WanxiangStateService({
+    workspaceRegistry: registry, projectsRoot: root, dataRoot, id: () => 'pending-id',
+  });
+  await projectState.getProject(workspace.id);
+
+  const ctx = new Context();
+  await ctx.plugin(NoopSubagents);
+  await ctx.plugin(SessionStore);
+  await ctx.plugin(SessionProjectionRegistry);
+  await ctx.plugin(WorkerThreadWorkflowEngine, { provider: 'spawn', disposeGraceMs: 1_000 });
+  t.after(() => ctx.fiber.dispose());
+  ctx.sessionProjections.register(createProxyRunProjectionDefinition());
+  const session = ctx.sessions.create('session-lineage', { meta: { cwd: workspacePath } });
+  const agent = { id: session.id, session };
+  const activeState = { brief: { revision: 7 }, work: { sessionId: session.id, activeRevision: 7 } };
+  const evaluationStore = new EvaluationProjectStore({ dataRoot });
+  const tool = createProxyRunToolAdapter({
+    projectService: {
+      async contextForAgent() {
+        return { workspaceId: workspace.id, workspacePath, state: activeState };
+      },
+      startEvaluationRun: (...args) => projectState.startEvaluationRun(...args),
+      finishEvaluationRun: (...args) => projectState.finishEvaluationRun(...args),
+    },
+    evaluationStore,
+    runner: new RestrictedWorkflowRunner(),
+    workflowEngine: ctx.workflowEngine,
+    evidenceStore: new RunEvidenceStore({ dataRoot }),
+    flushSession: async () => {},
+    createRunId: () => 'run-cross-located',
+    now: () => '2026-09-02T10:00:00.000Z',
+  });
+
+  const result = await tool.execute(
+    { caseId: DEFAULT_PROXY_RUN_CASE_ID },
+    { agent, signal: new AbortController().signal },
+  );
+  const project = await projectState.getProject(workspace.id);
+  const projection = ctx.sessionProjections.snapshot(session).values['wanxiang.proxy-run'];
+
+  assert.equal(result.runId, 'run-cross-located');
+  assert.equal(project.runs.byId[result.runId].status, 'passed');
+  assert.equal(project.runs.byId[result.runId].sessionId, session.id);
+  assert.equal(projection.runs[result.runId].projectId, workspace.id);
+  assert.equal(projection.runs[result.runId].sessionId, session.id);
+});
+
 test('customer follow-up proxy slice runs all five protected cases with stable structured judgments', async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'wanxiang-follow-up-contract-'));
   const workspacePath = path.join(root, 'workspace');
@@ -111,7 +172,11 @@ test('customer follow-up proxy slice runs all five protected cases with stable s
   const state = { brief: { revision: 4 }, work: { sessionId: agent.id, activeRevision: 4 } };
   let nextRunId = 0;
   const tool = createProxyRunToolAdapter({
-    projectService: { async contextForAgent() { return { workspaceId: 'project-1', workspacePath, state }; } },
+    projectService: {
+      async contextForAgent() { return { workspaceId: 'project-1', workspacePath, state }; },
+      async startEvaluationRun() {},
+      async finishEvaluationRun() {},
+    },
     evaluationStore,
     runner: new RestrictedWorkflowRunner(),
     workflowEngine: ctx.workflowEngine,
@@ -168,7 +233,11 @@ test('the evaluation tool reruns an Agent-modified Workflow against the same pro
   const state = { brief: { revision: 4 }, work: { sessionId: agent.id, activeRevision: 4 } };
   const evidence = [];
   const tool = createProxyRunToolAdapter({
-    projectService: { async contextForAgent() { return { workspaceId: 'project-1', workspacePath, state }; } },
+    projectService: {
+      async contextForAgent() { return { workspaceId: 'project-1', workspacePath, state }; },
+      async startEvaluationRun() {},
+      async finishEvaluationRun() {},
+    },
     evaluationStore,
     runner: new RestrictedWorkflowRunner(),
     workflowEngine: ctx.workflowEngine,

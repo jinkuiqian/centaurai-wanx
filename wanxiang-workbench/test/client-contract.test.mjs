@@ -43,6 +43,18 @@ test('v0.3.3 identifies all five proxy-slice cases in the native tool timeline',
   assert.match(client, /查看运行证据/u);
 });
 
+test('v0.3.4 distinguishes running, pass, partial failure, timeout and cancellation in the native tool view', () => {
+  assert.match(client, /function proxyRunConclusion\(block\)/u);
+  assert.match(client, /const errorCode = block\.error\?\.code/u);
+  for (const conclusion of ['代理运行中', '代理运行通过', '部分失败', '运行超时', '运行已取消']) {
+    assert.match(client, new RegExp(conclusion, 'u'));
+  }
+  assert.match(client, /workflow_timeout/u);
+  assert.match(client, /workflow_cancelled/u);
+  assert.match(client, /proxy_run_assertion_failed/u);
+  assert.match(client, /retryOf/u);
+});
+
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {
   assert.match(client, /function GuidanceDock\(\{ session, sessionId, input, inputActions \}\)/u);
   assert.match(client, /inputActions\.setDraft\(example\.draft\)/u);

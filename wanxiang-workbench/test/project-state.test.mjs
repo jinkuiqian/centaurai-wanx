@@ -721,6 +721,81 @@ test('Agent brief updates derive the managed workspace and reject subagents', as
   });
 });
 
+test('protected project state keeps immutable evaluation attempts and retry lineage by runId', async (t) => {
+  const root = await temporaryDirectory(t);
+  const dataRoot = await temporaryDirectory(t);
+  const workspace = { id: 'workspace-runs', path: root, title: '项目', sessionIds: ['session-1'] };
+  const service = serviceFor(registryFor(workspace), { dataRoot });
+  const run = {
+    runId: 'run-1',
+    sessionId: 'session-1',
+    caseId: 'case-1',
+    workflowVersion: '2.0.0',
+    evalRevision: 3,
+    workBriefRevision: 7,
+    retryOf: null,
+    startedAt: '2026-09-02T10:00:00.000Z',
+  };
+
+  const running = await service.startEvaluationRun(workspace.id, run);
+  assert.equal(running.runs.byId['run-1'].status, 'running');
+  assert.equal(running.runs.latestRunId, 'run-1');
+
+  const failed = await service.finishEvaluationRun(workspace.id, {
+    runId: 'run-1',
+    status: 'failed',
+    conclusion: 'timed_out',
+    completedAt: '2026-09-02T10:00:05.000Z',
+    evidence: { summary: 'Workflow 超时。', assertions: [], error: { code: 'workflow_timeout', message: 'Workflow 超时。' } },
+  });
+  const failedVersion = failed.stateVersion;
+  assert.equal(failed.runs.byId['run-1'].conclusion, 'timed_out');
+
+  const duplicate = await service.finishEvaluationRun(workspace.id, {
+    runId: 'run-1',
+    status: 'failed',
+    conclusion: 'timed_out',
+    completedAt: '2026-09-02T10:00:05.000Z',
+    evidence: { summary: 'Workflow 超时。', assertions: [], error: { code: 'workflow_timeout', message: 'Workflow 超时。' } },
+  });
+  assert.equal(duplicate.stateVersion, failedVersion);
+  await assert.rejects(service.finishEvaluationRun(workspace.id, {
+    runId: 'run-1', status: 'passed', conclusion: 'passed', completedAt: '2026-09-02T10:00:06.000Z', evidence: {},
+  }), { code: 'evaluation_run_already_finalized' });
+
+  const retried = await service.startEvaluationRun(workspace.id, {
+    ...run,
+    runId: 'run-2',
+    retryOf: 'run-1',
+    startedAt: '2026-09-02T10:01:00.000Z',
+  });
+  assert.deepEqual(retried.runs.order, ['run-1', 'run-2']);
+  assert.equal(retried.runs.byId['run-2'].retryOf, 'run-1');
+  assert.equal(retried.runs.byId['run-1'].status, 'failed');
+  const competing = await Promise.allSettled([
+    service.finishEvaluationRun(workspace.id, {
+      runId: 'run-2', status: 'passed', conclusion: 'passed', completedAt: '2026-09-02T10:01:01.000Z',
+      evidence: { summary: '通过', assertions: [{ id: 'a', passed: true }] },
+    }),
+    service.finishEvaluationRun(workspace.id, {
+      runId: 'run-2', status: 'cancelled', conclusion: 'cancelled', completedAt: '2026-09-02T10:01:02.000Z',
+      evidence: { summary: '取消', assertions: [], error: { code: 'workflow_cancelled', message: '取消' } },
+    }),
+  ]);
+  assert.equal(competing.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(competing.filter((result) => result.status === 'rejected').length, 1);
+  assert.equal(competing.find((result) => result.status === 'rejected').reason.code, 'evaluation_run_already_finalized');
+  await assert.rejects(service.startEvaluationRun(workspace.id, { ...run, runId: 'run-1' }), {
+    code: 'evaluation_run_id_conflict',
+  });
+
+  const canonical = JSON.parse(await readFile(canonicalProjectStatePath(dataRoot, workspace.id), 'utf8'));
+  const mirror = JSON.parse(await readFile(path.join(root, '.wanxiang', 'project.json'), 'utf8'));
+  assert.equal(canonical.runs.byId['run-2'].retryOf, 'run-1');
+  assert.notEqual(canonical.runs.byId['run-2'].status, 'running');
+  assert.equal(mirror.runs.byId['run-1'].conclusion, 'timed_out');
+});
+
 test('project creation requires a host-owned root', async () => {
   const service = serviceFor(registryFor());
   await assert.rejects(service.createProject('新项目'), { code: 'project_root_unavailable', statusCode: 503 });

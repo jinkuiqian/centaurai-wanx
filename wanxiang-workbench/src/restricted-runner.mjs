@@ -28,6 +28,7 @@ export class RestrictedWorkflowRunner {
       || !path.isAbsolute(request.workspacePath) || typeof request.source !== 'string') {
       throw runnerError('workflow_entrypoint_invalid', 'Workflow 入口无效。');
     }
+    if (request.signal?.aborted) throw runnerError('workflow_cancelled', '用户已取消代理运行。', 499);
     const capability = DENIED_SOURCE_PATTERNS.find(([pattern]) => pattern.test(request.source));
     if (capability) {
       throw runnerError('workflow_capability_denied', `Workflow 请求了被禁止的 ${capability[1]} 能力。`, 403);
@@ -38,10 +39,11 @@ export class RestrictedWorkflowRunner {
     if (stat.isSymbolicLink() || path.dirname(realEntry) !== realRoot) {
       throw runnerError('workflow_entrypoint_invalid', 'Workflow 入口必须是项目内的普通文件。', 403);
     }
-    return this.#spawn(realEntry, realRoot, request.input);
+    if (request.signal?.aborted) throw runnerError('workflow_cancelled', '用户已取消代理运行。', 499);
+    return this.#spawn(realEntry, realRoot, request.input, request.signal);
   }
 
-  #spawn(entrypoint, cwd, input) {
+  #spawn(entrypoint, cwd, input, signal) {
     return new Promise((resolve, reject) => {
       const child = spawn(this.executable, [
         '--permission',
@@ -57,10 +59,16 @@ export class RestrictedWorkflowRunner {
       let stderr = Buffer.alloc(0);
       let settled = false;
       let oversized = false;
+      let timer;
+      const onAbort = () => {
+        child.kill('SIGKILL');
+        finish(() => reject(runnerError('workflow_cancelled', '用户已取消代理运行。', 499)));
+      };
       const finish = (operation) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
         operation();
       };
       const append = (current, chunk) => {
@@ -86,11 +94,16 @@ export class RestrictedWorkflowRunner {
           return reject(runnerError('workflow_output_malformed', 'Workflow 输出不是有效的 JSON 对象。', 400, cause));
         }
       }));
-      const timer = setTimeout(() => {
+      timer = setTimeout(() => {
         child.kill('SIGKILL');
         finish(() => reject(runnerError('workflow_timeout', `Workflow 超过 ${this.timeoutMs}ms 时间限制。`, 408)));
       }, this.timeoutMs);
       timer.unref();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
       child.stdin.end(`${JSON.stringify(input)}\n`);
     });
   }

@@ -958,6 +958,24 @@ window.__ModuleLoader__.load({
         return proxyRunCaseLabels[caseId] || caseId || "代表案例";
       } catch { return "代表案例"; }
     }
+
+    function proxyRunRetry(block) {
+      const call = "kind" in block ? block.call : block;
+      if (!call?.argsRaw) return null;
+      try {
+        const retryOf = JSON.parse(call.argsRaw).retryOf;
+        return typeof retryOf === "string" && retryOf ? retryOf : null;
+      } catch { return null; }
+    }
+
+    function proxyRunConclusion(block) {
+      if (!("kind" in block)) return "running";
+      const errorCode = block.error?.code;
+      if (errorCode === "workflow_cancelled") return "cancelled";
+      if (errorCode === "workflow_timeout") return "timed_out";
+      if (errorCode === "proxy_run_assertion_failed") return "partial_failed";
+      return block.isError ? "failed" : "passed";
+    }
     function ToolStatusView({ state, copy, inspect, inspectLabel }) {
       return h("div", { className: "wx-tool-brief", "data-state": state, role: state === "error" ? "alert" : "status", "aria-live": "polite" },
         h("span", { className: "wx-tool-icon", "aria-hidden": "true" }, state === "ok" ? h(Icon, { name: "check", size: 13 }) : h(Icon, { name: "brief", size: 13 })),
@@ -984,12 +1002,19 @@ window.__ModuleLoader__.load({
     }
 
     function ProxyRunToolView({ block, inspect }) {
-      const done = "kind" in block;
-      const state = !done ? "running" : block.isError ? "error" : "ok";
+      const conclusion = proxyRunConclusion(block);
+      const state = conclusion === "running" ? "running" : conclusion === "passed" ? "ok" : "error";
       const caseTitle = proxyRunCase(block);
-      const copy = state === "running" ? `代理垂直切片 · ${caseTitle} · 代理运行中`
-        : state === "error" ? `代理垂直切片 · ${caseTitle} · 未通过`
-          : `代理垂直切片 · ${caseTitle} · 代理运行通过`;
+      const retry = proxyRunRetry(block) ? " · 重试" : "";
+      const labels = {
+        running: "代理运行中",
+        passed: "代理运行通过",
+        partial_failed: "部分失败（已保留完成结果）",
+        timed_out: "运行超时",
+        cancelled: "运行已取消",
+        failed: "未通过",
+      };
+      const copy = `代理垂直切片 · ${caseTitle} · ${labels[conclusion]}${retry}`;
       return h(ToolStatusView, { state, copy, inspect, inspectLabel: "查看运行证据" });
     }
 

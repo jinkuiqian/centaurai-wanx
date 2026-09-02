@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { link, mkdir, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { DEFAULT_PROXY_RUN_CASE_ID, PROXY_RUN_CASE_IDS } from './evaluation-state.mjs';
 
@@ -53,12 +53,13 @@ const PRESET_INPUT = Object.freeze({
 });
 
 export function initialProxyRunProjection() {
-  return { status: 'idle', runCount: 0, latest: null, cases: {} };
+  return { status: 'idle', runCount: 0, latest: null, cases: {}, runs: {} };
 }
 
 export function applyProxyRunEvent(state, event) {
   if (event?.type === 'tool-workflow/run-start' && event.data?.name === PROXY_RUN_WORKFLOW_NAME) {
     const data = event.data;
+    if (state.runs?.[data.runId]) return state;
     const latest = {
       runId: data.runId,
       projectId: data.projectId,
@@ -67,9 +68,11 @@ export function applyProxyRunEvent(state, event) {
       workflowVersion: data.workflowVersion,
       evalRevision: data.evalRevision,
       workBriefRevision: data.workBriefRevision,
+      retryOf: data.retryOf ?? null,
       status: 'running',
       startedAt: data.startedAt,
       completedAt: null,
+      conclusion: null,
       evidence: null,
     };
     return {
@@ -77,24 +80,34 @@ export function applyProxyRunEvent(state, event) {
       runCount: state.runCount + 1,
       latest,
       cases: { ...state.cases, [data.caseId]: latest },
+      runs: { ...state.runs, [data.runId]: latest },
     };
   }
   if (event?.type !== 'tool-workflow/run-end') return state;
-  const caseId = Object.keys(state.cases).find((id) => state.cases[id].runId === event.data?.runId);
-  if (!caseId) return state;
+  const current = state.runs?.[event.data?.runId];
+  if (!current || current.status !== 'running') return state;
   const completed = {
-    ...state.cases[caseId],
+    ...current,
     status: event.data.status,
     completedAt: event.data.completedAt,
+    conclusion: event.data.conclusion ?? inferConclusion(event.data),
     evidence: event.data.evidence,
   };
   const isLatest = event.data.runId === state.latest?.runId;
+  const isLatestForCase = event.data.runId === state.cases[current.caseId]?.runId;
   return {
     ...state,
     status: isLatest ? event.data.status : state.status,
     latest: isLatest ? completed : state.latest,
-    cases: { ...state.cases, [caseId]: completed },
+    cases: isLatestForCase ? { ...state.cases, [current.caseId]: completed } : state.cases,
+    runs: { ...state.runs, [event.data.runId]: completed },
   };
+}
+
+function inferConclusion(data) {
+  if (data.status === 'cancelled') return 'cancelled';
+  if (data.status === 'failed' && data.evidence?.error?.code === 'workflow_timeout') return 'timed_out';
+  return data.status;
 }
 
 export function createProxyRunProjectionDefinition() {
@@ -102,7 +115,7 @@ export function createProxyRunProjectionDefinition() {
   return {
     key: 'wanxiang.proxy-run',
     stateSchema: schema,
-    stateVersion: 2,
+    stateVersion: 3,
     init: initialProxyRunProjection,
     apply: applyProxyRunEvent,
     wire: {
@@ -124,8 +137,19 @@ export class RunEvidenceStore {
     const filename = path.join(directory, `${digest(evidence.runId)}.json`);
     const pending = path.join(directory, `.${digest(evidence.runId)}.${this.createPendingId()}.pending`);
     await mkdir(directory, { recursive: true });
-    await writeFile(pending, `${JSON.stringify(evidence, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    await rename(pending, filename);
+    await writeFile(pending, `${JSON.stringify(evidence, null, 2)}\n`, {
+      encoding: 'utf8', mode: 0o600, flag: 'wx',
+    });
+    try {
+      await link(pending, filename);
+    } catch (error) {
+      if (error?.code === 'EEXIST') {
+        throw proxyRunError('evaluation_run_id_conflict', '这个代理运行 ID 已经存在，证据不能被覆盖。', 409);
+      }
+      throw error;
+    } finally {
+      await unlink(pending).catch(() => {});
+    }
     return filename;
   }
 }
@@ -168,6 +192,10 @@ export function createProxyRunToolAdapter({
           type: 'string',
           description: 'A representative case ID from the current confirmed acceptance revision.',
         },
+        retryOf: {
+          type: 'string',
+          description: 'The completed runId this retry follows, when this attempt is a retry.',
+        },
       },
       required: ['caseId'],
     },
@@ -190,7 +218,8 @@ export function createProxyRunToolAdapter({
     },
     async execute(args, execution) {
       if (!args || typeof args.caseId !== 'string' || !args.caseId.trim()
-        || Object.keys(args).some((key) => key !== 'caseId')) {
+        || (args.retryOf !== undefined && (typeof args.retryOf !== 'string' || !args.retryOf.trim()))
+        || Object.keys(args).some((key) => !['caseId', 'retryOf'].includes(key))) {
         throw proxyRunError('proxy_run_case_invalid', '需要指定当前验收标准中的代表案例。', 400);
       }
       const agent = execution.agent;
@@ -207,6 +236,10 @@ export function createProxyRunToolAdapter({
       if (!evaluationStore || !runner || !context.workspacePath) {
         throw proxyRunError('proxy_run_configuration_invalid', '当前项目的受限评测环境尚未就绪。');
       }
+      if (typeof projectService.startEvaluationRun !== 'function'
+        || typeof projectService.finishEvaluationRun !== 'function') {
+        throw proxyRunError('proxy_run_configuration_invalid', '当前项目的运行证据存储尚未就绪。');
+      }
       const evaluation = await evaluationStore.load({
         workspaceId: context.workspaceId,
         workspacePath: context.workspacePath,
@@ -215,16 +248,21 @@ export function createProxyRunToolAdapter({
       if (!evalCase) throw proxyRunError('proxy_run_case_invalid', '当前验收标准不包含这个代表案例。', 400);
       const runId = String(createRunId());
       const startedAt = now();
-      agent.session.append('tool-workflow/run-start', {
+      const runStart = {
         runId,
-        name: PROXY_RUN_WORKFLOW_NAME,
-        projectId: context.workspaceId,
         sessionId,
         caseId: evalCase.id,
         workflowVersion: evaluation.workflow.workflowVersion,
         evalRevision: evaluation.eval.revision,
         workBriefRevision: context.state.brief.revision,
+        retryOf: args.retryOf?.trim() || null,
         startedAt,
+      };
+      await projectService.startEvaluationRun(String(context.workspaceId), runStart);
+      agent.session.append('tool-workflow/run-start', {
+        ...runStart,
+        name: PROXY_RUN_WORKFLOW_NAME,
+        projectId: context.workspaceId,
       });
       await flushSession(agent.session);
 
@@ -234,6 +272,7 @@ export function createProxyRunToolAdapter({
           entrypoint: evaluation.workflow.entrypoint,
           source: evaluation.source,
           input: structuredClone(evalCase.input),
+          signal: execution.signal,
         });
         const request = {
           script: PROXY_RUN_SCRIPT,
@@ -253,13 +292,20 @@ export function createProxyRunToolAdapter({
         } finally {
           await run.dispose();
         }
-        const value = normalizeProxyRunValue(result);
+        const failure = result.stopReason === 'completed' ? null : normalizeWorkflowResultFailure(result, execution.signal);
+        const terminal = failure ? terminalForFailure(failure) : null;
+        const value = failure
+          ? { status: terminal.status, summary: failure.message, assertions: [], error: failure }
+          : normalizeProxyRunValue(result);
         const evidence = evaluationEvidence({
-          runId, context, sessionId, evaluation, evalCase, startedAt, completedAt: now(), value,
+          runId, retryOf: runStart.retryOf, context, sessionId, evaluation, evalCase, startedAt, completedAt: now(), value,
         });
-        await recordEvaluationResult(agent.session, evidenceStore, flushSession, evidence, result.stopReason);
-        if (result.stopReason !== 'completed') {
-          throw Object.assign(proxyRunError('proxy_run_workflow_failed', result.error || '代理运行未能完成。'), { evaluationRecorded: true });
+        await recordEvaluationResult(
+          agent.session, evidenceStore, projectService, flushSession, evidence,
+          terminal?.conclusion ?? (evidence.status === 'passed' ? 'passed' : 'failed'), result.stopReason,
+        );
+        if (failure) {
+          throw Object.assign(proxyRunError(failure.code, failure.message, failure.statusCode), { evaluationRecorded: true });
         }
         if (evidence.status !== 'passed') {
           throw Object.assign(proxyRunError('proxy_run_assertion_failed', evidence.summary), { evaluationRecorded: true });
@@ -267,27 +313,32 @@ export function createProxyRunToolAdapter({
         return evidence;
       } catch (error) {
         if (error?.evaluationRecorded) throw error;
-        const failure = normalizeFailure(error);
+        const failure = normalizeFailure(error, execution.signal);
+        const terminal = terminalForFailure(failure);
         const evidence = evaluationEvidence({
-          runId,
+          runId, retryOf: runStart.retryOf,
           context,
           sessionId,
           evaluation,
           evalCase,
           startedAt,
           completedAt: now(),
-          value: { status: 'failed', summary: failure.message, assertions: [], error: failure },
+          value: { status: terminal.status, summary: failure.message, assertions: [], error: failure },
         });
-        await recordEvaluationResult(agent.session, evidenceStore, flushSession, evidence, 'error');
+        await recordEvaluationResult(
+          agent.session, evidenceStore, projectService, flushSession, evidence, terminal.conclusion,
+          terminal.status === 'cancelled' ? 'cancelled' : 'error',
+        );
         throw Object.assign(error instanceof Error ? error : new Error(failure.message), failure, { evaluationRecorded: true });
       }
     },
   };
 }
 
-function evaluationEvidence({ runId, context, sessionId, evaluation, evalCase, startedAt, completedAt, value }) {
+function evaluationEvidence({ runId, retryOf, context, sessionId, evaluation, evalCase, startedAt, completedAt, value }) {
   return {
     runId,
+    retryOf,
     projectId: String(context.workspaceId),
     sessionId,
     workflowVersion: evaluation.workflow.workflowVersion,
@@ -304,28 +355,46 @@ function evaluationEvidence({ runId, context, sessionId, evaluation, evalCase, s
   };
 }
 
-async function recordEvaluationResult(session, evidenceStore, flushSession, evidence, stopReason) {
+async function recordEvaluationResult(session, evidenceStore, projectService, flushSession, evidence, conclusion, stopReason) {
   await evidenceStore.save(evidence);
-  session.append('tool-workflow/run-end', {
+  const eventEvidence = {
+    summary: evidence.summary,
+    assertions: evidence.assertions,
+    ...(evidence.output ? { output: evidence.output } : {}),
+    ...(evidence.error ? { error: evidence.error } : {}),
+  };
+  const terminal = {
     runId: evidence.runId,
-    stopReason,
     status: evidence.status,
+    conclusion,
     completedAt: evidence.completedAt,
-    evidence: {
-      summary: evidence.summary,
-      assertions: evidence.assertions,
-      ...(evidence.output ? { output: evidence.output } : {}),
-      ...(evidence.error ? { error: evidence.error } : {}),
-    },
-  });
+    evidence: eventEvidence,
+  };
+  await projectService.finishEvaluationRun(evidence.projectId, terminal);
+  session.append('tool-workflow/run-end', { ...terminal, stopReason });
   await flushSession(session);
 }
 
-function normalizeFailure(error) {
+function normalizeFailure(error, signal) {
+  const cancelled = signal?.aborted || error?.name === 'AbortError' || error?.code === 'workflow_cancelled';
   return {
-    code: typeof error?.code === 'string' ? error.code : 'proxy_run_workflow_failed',
-    message: error instanceof Error && error.message ? error.message : '代理运行未能完成。',
+    code: cancelled ? 'workflow_cancelled' : typeof error?.code === 'string' ? error.code : 'proxy_run_workflow_failed',
+    message: cancelled ? '用户已取消代理运行。' : error instanceof Error && error.message ? error.message : '代理运行未能完成。',
+    ...(Number.isInteger(error?.statusCode) ? { statusCode: error.statusCode } : {}),
   };
+}
+
+function normalizeWorkflowResultFailure(result, signal) {
+  const error = Object.assign(new Error(result?.error || '代理运行未能完成。'), {
+    code: result?.stopReason === 'cancelled' || signal?.aborted ? 'workflow_cancelled' : 'proxy_run_workflow_failed',
+  });
+  return normalizeFailure(error, signal);
+}
+
+function terminalForFailure(failure) {
+  if (failure.code === 'workflow_cancelled') return { status: 'cancelled', conclusion: 'cancelled' };
+  if (failure.code === 'workflow_timeout') return { status: 'failed', conclusion: 'timed_out' };
+  return { status: 'failed', conclusion: 'failed' };
 }
 
 function normalizeProxyRunValue(result) {
@@ -353,10 +422,11 @@ function proxyRunProjectionSchema() {
   return {
     parse(value) {
       if (!value || typeof value !== 'object' || Array.isArray(value)
-        || !['idle', 'running', 'passed', 'failed'].includes(value.status)
+        || !['idle', 'running', 'passed', 'failed', 'cancelled'].includes(value.status)
         || !Number.isSafeInteger(value.runCount) || value.runCount < 0
         || (value.latest !== null && (typeof value.latest !== 'object' || Array.isArray(value.latest)))
-        || !value.cases || typeof value.cases !== 'object' || Array.isArray(value.cases)) {
+        || !value.cases || typeof value.cases !== 'object' || Array.isArray(value.cases)
+        || !value.runs || typeof value.runs !== 'object' || Array.isArray(value.runs)) {
         throw new Error('invalid Wanxiang proxy-run projection');
       }
       return value;

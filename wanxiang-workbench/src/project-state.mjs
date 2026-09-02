@@ -60,8 +60,67 @@ export function createInitialState(projectName, timestamp = new Date().toISOStri
       confirmedFieldSources: null,
     },
     work: { sessionId: null, activeRevision: null, activation: null },
+    runs: initialEvaluationRuns(),
     createdAt: timestamp,
     updatedAt: timestamp,
+  };
+}
+
+function initialEvaluationRuns() {
+  return { latestRunId: null, order: [], byId: {} };
+}
+
+function startEvaluationRunState(current, input) {
+  if (!isEvaluationRunStart(input)) {
+    throw serviceError(400, 'evaluation_run_invalid', '代理运行记录无效。');
+  }
+  if (current.runs.byId[input.runId]) {
+    throw serviceError(409, 'evaluation_run_id_conflict', '这个代理运行 ID 已经存在，不能复用。');
+  }
+  if (input.retryOf !== null) {
+    const previous = current.runs.byId[input.retryOf];
+    if (!previous || previous.status === 'running' || previous.caseId !== input.caseId) {
+      throw serviceError(409, 'evaluation_retry_invalid', '重试必须关联同一案例中已经结束的前一次运行。');
+    }
+  }
+  const run = {
+    ...structuredClone(input),
+    status: 'running',
+    completedAt: null,
+    conclusion: null,
+    evidence: null,
+  };
+  return {
+    ...current,
+    stateVersion: current.stateVersion + 1,
+    runs: {
+      latestRunId: run.runId,
+      order: [...current.runs.order, run.runId],
+      byId: { ...current.runs.byId, [run.runId]: run },
+    },
+    updatedAt: run.startedAt,
+  };
+}
+
+function finishEvaluationRunState(current, input) {
+  if (!isEvaluationRunFinish(input)) {
+    throw serviceError(400, 'evaluation_run_invalid', '代理运行结论无效。');
+  }
+  const run = current.runs.byId[input.runId];
+  if (!run) throw serviceError(404, 'evaluation_run_not_found', '找不到这次代理运行。');
+  const completed = { ...run, ...structuredClone(input) };
+  if (run.status !== 'running') {
+    if (JSON.stringify(run) === JSON.stringify(completed)) return current;
+    throw serviceError(409, 'evaluation_run_already_finalized', '这次代理运行已经结束，不能改写结论。', { current: run });
+  }
+  return {
+    ...current,
+    stateVersion: current.stateVersion + 1,
+    runs: {
+      ...current.runs,
+      byId: { ...current.runs.byId, [run.runId]: completed },
+    },
+    updatedAt: input.completedAt,
   };
 }
 
@@ -477,6 +536,26 @@ export class WanxiangStateService {
       this.id,
       this.dataRoot,
     ));
+  }
+
+  async startEvaluationRun(workspaceId, input) {
+    const workspace = await this.resolveWorkspace(workspaceId);
+    return withSerialLock(workspaceLocks, String(workspace.id), async () => {
+      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const next = startEvaluationRunState(current, input);
+      await writeProjectState(workspace, next, this.dataRoot, this.id);
+      return next;
+    });
+  }
+
+  async finishEvaluationRun(workspaceId, input) {
+    const workspace = await this.resolveWorkspace(workspaceId);
+    return withSerialLock(workspaceLocks, String(workspace.id), async () => {
+      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const next = finishEvaluationRunState(current, input);
+      if (next !== current) await writeProjectState(workspace, next, this.dataRoot, this.id);
+      return next;
+    });
   }
 
   async updateProject(workspaceId, baseVersion, update) {
@@ -1088,7 +1167,9 @@ async function reconcileFailedActivationArtifact(workspacePath, state, id) {
 export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers = null } = {}) {
   if (state?.schemaVersion === 2) {
     if (Object.hasOwn(state.brief || {}, 'confirmedAnswers')
-      && Object.hasOwn(state.brief || {}, 'confirmedFieldSources')) return validateV2State(state);
+      && Object.hasOwn(state.brief || {}, 'confirmedFieldSources')) {
+      return validateV2State(Object.hasOwn(state, 'runs') ? state : { ...state, runs: initialEvaluationRuns() });
+    }
     const confirmedAnswers = state.brief?.confirmedRevision === null
       ? null
       : (state.brief.confirmedRevision === state.brief.revision ? state.brief.answers : recoveredAnswers);
@@ -1153,6 +1234,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
       activeRevision: activation?.status === 'active' ? activation.briefRevision : null,
       activation,
     },
+    runs: initialEvaluationRuns(),
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
   });
@@ -1186,6 +1268,7 @@ function validateV1State(state) {
 function validateV2State(state) {
   if (!state || state.schemaVersion !== 2 || !Number.isInteger(state.stateVersion) || state.stateVersion < 1
     || typeof state.projectName !== 'string' || !state.projectName.trim() || !state.brief || !state.work
+    || !isEvaluationRuns(state.runs)
     || !Number.isInteger(state.brief.revision) || state.brief.revision < 0
     || !(state.brief.confirmedRevision === null || (Number.isInteger(state.brief.confirmedRevision)
       && state.brief.confirmedRevision >= 0 && state.brief.confirmedRevision <= state.brief.revision))
@@ -1233,6 +1316,62 @@ function validateV2State(state) {
     throw corruptState();
   }
   return state;
+}
+
+function isEvaluationRuns(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !(value.latestRunId === null || typeof value.latestRunId === 'string')
+    || !Array.isArray(value.order) || !value.byId || typeof value.byId !== 'object' || Array.isArray(value.byId)
+    || new Set(value.order).size !== value.order.length
+    || value.order.some((runId) => typeof runId !== 'string' || !isEvaluationRun(value.byId[runId]))
+    || Object.keys(value.byId).length !== value.order.length
+    || (value.latestRunId !== null && value.latestRunId !== value.order.at(-1))) return false;
+  return Object.entries(value.byId).every(([runId, run]) => run.runId === runId
+    && (run.retryOf === null || (value.byId[run.retryOf] && value.order.indexOf(run.retryOf) < value.order.indexOf(runId))));
+}
+
+function isEvaluationRunStart(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).every((key) => ['runId', 'sessionId', 'caseId', 'workflowVersion', 'evalRevision', 'workBriefRevision', 'retryOf', 'startedAt'].includes(key))
+    && ['runId', 'sessionId', 'caseId', 'workflowVersion', 'startedAt'].every((key) => typeof value[key] === 'string' && value[key])
+    && Number.isInteger(value.evalRevision) && value.evalRevision > 0
+    && Number.isInteger(value.workBriefRevision) && value.workBriefRevision >= 0
+    && (value.retryOf === null || (typeof value.retryOf === 'string' && value.retryOf));
+}
+
+function isEvaluationRunFinish(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).every((key) => ['runId', 'status', 'conclusion', 'completedAt', 'evidence'].includes(key))
+    && typeof value.runId === 'string' && value.runId
+    && ['passed', 'failed', 'cancelled'].includes(value.status)
+    && ((value.status === 'passed' && value.conclusion === 'passed')
+      || (value.status === 'failed' && ['failed', 'timed_out'].includes(value.conclusion))
+      || (value.status === 'cancelled' && value.conclusion === 'cancelled'))
+    && typeof value.completedAt === 'string' && value.completedAt
+    && value.evidence && typeof value.evidence === 'object' && !Array.isArray(value.evidence);
+}
+
+function isEvaluationRun(value) {
+  if (!value || !isEvaluationRunStart({
+    runId: value.runId,
+    sessionId: value.sessionId,
+    caseId: value.caseId,
+    workflowVersion: value.workflowVersion,
+    evalRevision: value.evalRevision,
+    workBriefRevision: value.workBriefRevision,
+    retryOf: value.retryOf,
+    startedAt: value.startedAt,
+  })) return false;
+  if (value.status === 'running') {
+    return value.completedAt === null && value.conclusion === null && value.evidence === null;
+  }
+  return isEvaluationRunFinish({
+    runId: value.runId,
+    status: value.status,
+    conclusion: value.conclusion,
+    completedAt: value.completedAt,
+    evidence: value.evidence,
+  });
 }
 
 function isStructuredDispatchError(value) {

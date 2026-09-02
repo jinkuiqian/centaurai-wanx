@@ -32,6 +32,17 @@ test('restricted runner returns structured failures for timeout, nonzero exit, m
   }
 });
 
+test('restricted runner stops the child process and reports user cancellation explicitly', async (t) => {
+  const fixture = await runnerFixture(t, 'while (true) {}', { timeoutMs: 2_000 });
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const running = fixture.runner.run({ ...fixture.request({}), signal: controller.signal });
+  setTimeout(() => controller.abort(), 30);
+
+  await assert.rejects(running, (error) => error.code === 'workflow_cancelled');
+  assert.ok(Date.now() - startedAt < 1_000);
+});
+
 test('restricted runner rejects network, credential, filesystem and process escape attempts before execution', async (t) => {
   for (const source of [
     "await fetch('https://example.com');",
