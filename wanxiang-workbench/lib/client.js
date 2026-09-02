@@ -943,6 +943,11 @@ window.__ModuleLoader__.load({
         return Object.keys(patch.answers || patch).filter((key) => fieldKeys.has(key));
       } catch { return []; }
     }
+    function ToolStatusView({ state, copy, inspect, inspectLabel }) {
+      return h("div", { className: "wx-tool-brief", "data-state": state, role: state === "error" ? "alert" : "status", "aria-live": "polite" },
+        h("span", { className: "wx-tool-icon", "aria-hidden": "true" }, state === "ok" ? h(Icon, { name: "check", size: 13 }) : h(Icon, { name: "brief", size: 13 })),
+        h("span", null, copy), inspect ? h("button", { type: "button", onClick: inspect }, inspectLabel) : null);
+    }
     function WorkBriefToolView({ block, cwd, sessionId, inspect }) {
       const done = "kind" in block;
       const state = !done ? "running" : block.isError ? "error" : "ok";
@@ -960,9 +965,16 @@ window.__ModuleLoader__.load({
       const copy = state === "running" ? `正在更新工作说明${labels ? `：${labels}` : ""}`
         : state === "error" ? `工作说明更新失败${labels ? `：${labels}` : ""}`
           : `工作说明已更新${labels ? `：${labels}` : ""}${progress}`;
-      return h("div", { className: "wx-tool-brief", "data-state": state, role: state === "error" ? "alert" : "status", "aria-live": "polite" },
-        h("span", { className: "wx-tool-icon", "aria-hidden": "true" }, state === "ok" ? h(Icon, { name: "check", size: 13 }) : h(Icon, { name: "brief", size: 13 })),
-        h("span", null, copy), inspect ? h("button", { type: "button", onClick: inspect }, "查看记录") : null);
+      return h(ToolStatusView, { state, copy, inspect, inspectLabel: "查看记录" });
+    }
+
+    function ProxyRunToolView({ block, inspect }) {
+      const done = "kind" in block;
+      const state = !done ? "running" : block.isError ? "error" : "ok";
+      const copy = state === "running" ? "代理运行中 · 预置合成材料"
+        : state === "error" ? "代理运行未通过"
+          : "代理运行通过";
+      return h(ToolStatusView, { state, copy, inspect, inspectLabel: "查看运行证据" });
     }
 
     function ProductStyles() {
@@ -1160,6 +1172,7 @@ window.__ModuleLoader__.load({
       });
       ctx.slots.inject("conversation.session.header.actions", () => ctx.slots.register({ name: "conversation.session.header.actions", id: "wanxiang-work-brief", order: 10 }, HeaderBadge));
       ctx.slots.inject("tool.call.toolview", () => ctx.slots.register({ name: "tool.call.toolview", key: "wanxiang_update_work_brief" }, WorkBriefToolView));
+      ctx.slots.inject("tool.call.toolview", () => ctx.slots.register({ name: "tool.call.toolview", key: "wanxiang_run_evaluation" }, ProxyRunToolView));
       ctx.slots.inject("settings.onboarding", function* () {
         yield ctx.slots.register({ name: "settings.onboarding", id: "welcome-notice", priority: -10, order: -100 }, NoWelcomeNotice);
         yield ctx.slots.register({ name: "settings.onboarding", id: "deepseek-official", priority: -10, order: -99 }, NoWelcomeNotice);

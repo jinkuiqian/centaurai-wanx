@@ -16,11 +16,21 @@ test('v0.3 keeps DSH conversation, composer and tool lifecycle native', () => {
   assert.match(client, /ctx\.sessions\.list\.subscribe\(sync\)/u);
   assert.match(client, /document\.title = "万象"/u);
   assert.match(client, /slots\.inject\("tool\.call\.toolview"[\s\S]*wanxiang_update_work_brief/u);
+  assert.match(client, /slots\.inject\("tool\.call\.toolview"[\s\S]*wanxiang_run_evaluation[\s\S]*ProxyRunToolView/u);
   assert.match(client, /slots\.inject\("shell\.overlay"/u);
   assert.doesNotMatch(client, /slots\.inject\("conversation\.view"/u);
   assert.doesNotMatch(client, /slots\.inject\("conversation",/u);
   assert.doesNotMatch(client, /slots\.inject\("conversation\.composer\.bar"/u);
   assert.doesNotMatch(client, /__WANXIANG_WORKSPACE__/u);
+});
+
+test('v0.3.2 shows the proxy run and pass result in the existing DSH tool view', () => {
+  assert.match(client, /function ProxyRunToolView\(\{ block, inspect \}\)/u);
+  assert.match(client, /代理运行中/u);
+  assert.match(client, /代理运行通过/u);
+  assert.match(client, /block\.isError/u);
+  assert.match(client, /查看运行证据/u);
+  assert.doesNotMatch(client, /slots\.inject\("conversation\.view"[\s\S]*ProxyRun/u);
 });
 
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {

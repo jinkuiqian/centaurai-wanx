@@ -7,17 +7,24 @@ import {
   deriveProjectState,
   serviceError,
 } from './project-state.mjs';
+import {
+  RunEvidenceStore,
+  createProxyRunProjectionDefinition,
+  createProxyRunToolAdapter,
+} from './proxy-run.mjs';
 
 /** Wanxiang's product policy and browser branding, composed into every session. */
 export const name = 'wanxiang-workbench';
 export const inject = [
   'agents',
   'permissionPresets',
+  'sessionProjections',
   'sessions',
   'systemPrompt',
   'tools',
   'web',
   'webServer',
+  'workflowEngine',
   'workspaceRegistry',
 ];
 
@@ -55,15 +62,24 @@ const DISCOVERY_PRESET_CANDIDATES = ['wanxiang-discovery', 'read-only'];
 const BUILD_PRESET_CANDIDATES = ['wanxiang-build', 'workspace-write'];
 
 export function apply(ctx) {
+  const dataRoot = dataRootFromEnvironment();
   const service = new WanxiangStateService({
     workspaceRegistry: ctx.workspaceRegistry,
     projectsRoot: absoluteRoot(process.env.WANXIANG_WORKSPACE_ROOT),
-    dataRoot: dataRootFromEnvironment(),
+    dataRoot,
   });
+  const runEvidenceStore = new RunEvidenceStore({ dataRoot });
   const authorization = createAuthorizationTracker();
   void service.prepareRoots().catch(() => {});
 
   ctx.effect(() => ctx.tools.register(createWorkBriefTool(service)));
+  ctx.effect(() => ctx.sessionProjections.register(createProxyRunProjectionDefinition()));
+  ctx.effect(() => ctx.tools.register(createProxyRunToolAdapter({
+    projectService: service,
+    workflowEngine: ctx.workflowEngine,
+    evidenceStore: runEvidenceStore,
+    flushSession: (session) => ctx.sessions.flush(session),
+  })));
   if (!ctx.tools.get('web_fetch')) {
     ctx.effect(() => ctx.tools.register(createPublicWebFetchTool(ctx.web)));
   }

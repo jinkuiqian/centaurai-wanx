@@ -35,6 +35,7 @@
   "files": [
     "src/policy.mjs",
     "src/project-state.mjs",
+    "src/proxy-run.mjs",
     "lib/client.js",
     "cordis.patch.yml"
   ]

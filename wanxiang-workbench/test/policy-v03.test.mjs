@@ -4,14 +4,56 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  apply,
   createActivationApiHandler,
   createDiscoveryAuthorizationGuard,
   createPublicWebFetchTool,
   createWorkBriefTool,
   discoveryToolAllowed,
+  inject,
   renderPromptWorkDescription,
 } from '../src/policy.mjs';
 import { createInitialState, deriveProjectState, serviceError, updateProjectState } from '../src/project-state.mjs';
+
+test('workbench composition registers the proxy-run tool adapter and DSH projection seams', () => {
+  const registeredTools = new Map();
+  const projections = new Map();
+  const ctx = {
+    effect(effect) { return effect(); },
+    on() { return () => {}; },
+    agents: {},
+    permissionPresets: {},
+    workflowEngine: { start() { assert.fail('registration must not start a run'); } },
+    sessions: {
+      list: () => [],
+      async flush() {},
+    },
+    sessionProjections: {
+      register(definition) { projections.set(definition.key, definition); return () => {}; },
+    },
+    systemPrompt: {},
+    tools: {
+      get(name) { return name === 'web_fetch' ? {} : registeredTools.get(name); },
+      register(tool) { registeredTools.set(tool.name, tool); return () => {}; },
+      guard() { return () => {}; },
+    },
+    web: {},
+    webServer: {
+      tapIndex() { return () => {}; },
+      register() { return () => {}; },
+    },
+    workspaceRegistry: {
+      list: () => [],
+    },
+  };
+
+  apply(ctx);
+
+  assert.ok(inject.includes('workflowEngine'));
+  assert.ok(inject.includes('sessionProjections'));
+  assert.equal(registeredTools.get('wanxiang_run_evaluation')?.name, 'wanxiang_run_evaluation');
+  assert.equal(projections.get('wanxiang.proxy-run')?.stateVersion, 1);
+});
 
 test('work-description tool derives the project from the calling root agent and writes inferred sparse fields', async () => {
   const agent = { id: 'session-root', session: { header: {} } };
@@ -193,13 +235,16 @@ test('monotonic discovery guard blocks manual permission bypasses', () => {
     isDiscoveryExecutionAllowed: (execution) => allowed.has(execution),
   });
   const write = { name: 'write', arguments: {}, agent };
+  const proxyRun = { name: 'wanxiang_run_evaluation', arguments: { caseId: 'preset-proxy-run-v1' }, agent };
   const read = { name: 'read', arguments: { file_path: 'inside.txt' }, agent };
 
   assert.match(guard(write), /只允许读取/u);
+  assert.match(guard(proxyRun), /只允许读取/u);
   allowed.add(read);
   assert.equal(guard(read), undefined);
   buildAuthorized = true;
   assert.equal(guard(write), undefined);
+  assert.equal(guard(proxyRun), undefined);
 });
 
 test('activation reserves the same idle root session then durably switches it to project-write', async () => {
