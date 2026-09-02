@@ -537,7 +537,11 @@ test('first activation failure rolls confirmation back to an unconfirmed draft',
   let state = await service.getProject(workspace.id);
   state = await service.updateProject(workspace.id, state.stateVersion, {
     answers: Object.fromEntries(REQUIRED_BRIEF_FIELDS.map((key) => [key, `${key} answer`])),
+    fieldSources: Object.fromEntries(REQUIRED_BRIEF_FIELDS.map((key) => [key, {
+      status: 'inferred', sourceMessageIds: [],
+    }])),
   });
+  const beforeActivation = structuredClone(state);
   const reserved = await service.reserveActivation(workspace.id, {
     baseVersion: state.stateVersion,
     briefRevision: state.brief.revision,
@@ -550,11 +554,21 @@ test('first activation failure rolls confirmation back to an unconfirmed draft',
     error: { code: 'permission_transition_failed', message: '权限切换失败' },
   });
 
-  assert.equal(failed.brief.confirmedRevision, null);
-  assert.equal(failed.brief.confirmedAnswers, null);
+  assert.deepEqual(failed.brief, beforeActivation.brief);
+  assert.equal(failed.work.sessionId, null);
   assert.equal(failed.work.activeRevision, null);
   assert.equal(failed.work.activation.status, 'failed');
   assert.equal(Object.hasOwn(failed.work.activation, 'previousConfirmed'), false);
+  await assert.rejects(readFile(path.join(root, '.wanxiang', 'work-brief.md')), { code: 'ENOENT' });
+
+  const competingSession = await service.reserveActivation(workspace.id, {
+    baseVersion: failed.stateVersion,
+    briefRevision: failed.brief.revision,
+    sessionId: 'session-2',
+    retry: true,
+  });
+  assert.equal(competingSession.disposition, 'existing-session');
+  assert.deepEqual(competingSession.state, failed);
   await assert.rejects(readFile(path.join(root, '.wanxiang', 'work-brief.md')), { code: 'ENOENT' });
 });
 
@@ -580,9 +594,54 @@ test('failed activation is retry-safe and derived as a recoverable failure', () 
   assert.throws(() => reserveActivation(failed, { briefRevision: 1, sessionId: 'session-1' }), {
     code: 'activation_failed',
   });
+  const competingSession = reserveActivation(failed, {
+    briefRevision: 1, sessionId: 'session-2', retry: true,
+  }, undefined, 'activation-2');
+  assert.equal(competingSession.disposition, 'existing-session');
+  assert.equal(competingSession.activation.id, 'activation-1');
   const retry = reserveActivation(failed, { briefRevision: 1, sessionId: 'session-1', retry: true }, undefined, 'activation-2');
   assert.equal(retry.disposition, 'reserved');
   assert.equal(retry.activation.id, 'activation-2');
+  assert.equal(retry.state.work.sessionId, 'session-1');
+});
+
+test('a pending confirmation blocks concurrent brief edits instead of overwriting them during rollback', () => {
+  let state = updateProjectState(createInitialState('项目'), {
+    answers: Object.fromEntries(REQUIRED_BRIEF_FIELDS.map((key) => [key, `${key} answer`])),
+  });
+  state = confirmProjectState(state, state.brief.revision);
+  const pending = reserveActivation(state, {
+    briefRevision: state.brief.revision,
+    sessionId: 'session-1',
+  }).state;
+
+  assert.throws(() => updateProjectState(pending, { answers: { goal: '并发的新目标' } }), {
+    code: 'activation_in_progress',
+  });
+});
+
+test('migration releases a failed first-activation session left by an older state writer', () => {
+  const state = createInitialState('项目', '2026-01-01T00:00:00.000Z');
+  state.work = {
+    sessionId: 'session-old',
+    activeRevision: null,
+    activation: {
+      id: 'activation-old',
+      briefRevision: 0,
+      sessionId: 'session-old',
+      status: 'failed',
+      messageId: null,
+      error: { code: 'permission_transition_failed', message: '权限切换失败' },
+      createdAt: '2026-01-01T00:00:01.000Z',
+      updatedAt: '2026-01-01T00:00:02.000Z',
+    },
+  };
+
+  const migrated = migrateProjectState(state);
+
+  assert.equal(migrated.work.sessionId, null);
+  assert.equal(migrated.work.activation.sessionId, 'session-old');
+  assert.equal(migrated.work.activation.status, 'failed');
 });
 
 test('dispatch reservation is idempotent and finalization prevents a second send', () => {

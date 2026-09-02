@@ -163,6 +163,9 @@ export function parseLegacyBrief(markdown, fallbackName, timestamp = new Date().
 }
 
 export function updateProjectState(current, update, timestamp = new Date().toISOString()) {
+  if (current.work.activation?.status === 'pending') {
+    throw serviceError(409, 'activation_in_progress', '工作说明正在确认，请等待当前操作完成后再修改。', { current });
+  }
   const projectName = update.projectName ?? current.projectName;
   const answerPatch = validateAnswerPatch(update.answers || {});
   const sourcePatch = validateFieldSourcePatch(update.fieldSources || {});
@@ -397,6 +400,9 @@ export function reserveActivation(current, request, timestamp = new Date().toISO
   if (sameRevision && previous.status === 'pending') {
     return { disposition: 'in-progress', state: current, activation: previous };
   }
+  if (failedActivationBelongsToAnotherSession(current, request)) {
+    return { disposition: 'existing-session', state: current, activation: previous };
+  }
   if (current.work.sessionId && current.work.sessionId !== sessionId) {
     return { disposition: 'existing-session', state: current, activation: current.work.activation };
   }
@@ -416,6 +422,9 @@ export function reserveActivation(current, request, timestamp = new Date().toISO
     previousConfirmed: Object.hasOwn(request, 'previousConfirmed')
       ? cloneConfirmedSnapshot(request.previousConfirmed)
       : confirmedSnapshot(current),
+    previousBriefMetadata: Object.hasOwn(request, 'previousBriefMetadata')
+      ? cloneBriefMetadata(request.previousBriefMetadata)
+      : briefMetadata(current.brief),
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -446,16 +455,23 @@ export function finalizeActivation(current, request, timestamp = new Date().toIS
       && dispatchErrorsEqual(activation.error, error)) return current;
     throw serviceError(409, 'activation_already_finalized', '这次制作启动已经结束，不能重复改写结果。', { current });
   }
-  const { previousConfirmed, ...finalizedActivation } = activation;
-  const brief = request.status === 'failed'
+  const { previousConfirmed, previousBriefMetadata, ...finalizedActivation } = activation;
+  let brief = request.status === 'failed'
     ? restoreConfirmedSnapshot(current.brief, previousConfirmed)
     : current.brief;
+  if (request.status === 'failed' && previousBriefMetadata) {
+    brief = restoreBriefMetadata(brief, previousBriefMetadata);
+  }
+  const sessionId = request.status === 'failed' && current.work.activeRevision === null
+    ? null
+    : current.work.sessionId;
   return {
     ...current,
     stateVersion: current.stateVersion + 1,
     brief,
     work: {
       ...current.work,
+      sessionId,
       activeRevision: request.status === 'active' ? activation.briefRevision : current.work.activeRevision,
       activation: { ...finalizedActivation, status: request.status, messageId, error, updatedAt: timestamp },
     },
@@ -713,12 +729,20 @@ export class WanxiangStateService {
       assertBaseVersion(current, request.baseVersion);
       const sameOpenActivation = current.work.activation?.briefRevision === request.briefRevision
         && ['pending', 'active'].includes(current.work.activation.status);
+      if (failedActivationBelongsToAnotherSession(current, request)) {
+        return { disposition: 'existing-session', state: current, activation: current.work.activation };
+      }
       if (current.work.sessionId && current.work.sessionId !== request.sessionId && !sameOpenActivation) {
         return { disposition: 'existing-session', state: current, activation: current.work.activation };
       }
       const previousConfirmed = confirmedSnapshot(current);
+      const previousBriefMetadata = briefMetadata(current.brief);
       const confirmed = confirmProjectState(current, request.briefRevision, this.now());
-      const result = reserveActivation(confirmed, { ...request, previousConfirmed }, this.now(), this.id());
+      const result = reserveActivation(confirmed, {
+        ...request,
+        previousConfirmed,
+        previousBriefMetadata,
+      }, this.now(), this.id());
       if (result.state !== current) {
         await writeProjectState(workspace, result.state, this.dataRoot, this.id);
       }
@@ -1059,6 +1083,41 @@ function cloneFieldSources(value) {
   }]));
 }
 
+function briefMetadata(brief) {
+  return {
+    fieldSources: cloneFieldSources(brief.fieldSources),
+    deferredFields: [...brief.deferredFields],
+    lastChanges: cloneGuidanceChanges(brief.lastChanges),
+  };
+}
+
+function cloneBriefMetadata(value) {
+  if (!isValidBriefMetadata(value)) {
+    throw serviceError(400, 'activation_snapshot_invalid', '制作启动恢复点无效。');
+  }
+  return {
+    fieldSources: cloneFieldSources(value.fieldSources),
+    deferredFields: [...value.deferredFields],
+    lastChanges: cloneGuidanceChanges(value.lastChanges),
+  };
+}
+
+function restoreBriefMetadata(brief, snapshot) {
+  return {
+    ...brief,
+    fieldSources: cloneFieldSources(snapshot.fieldSources),
+    deferredFields: [...snapshot.deferredFields],
+    lastChanges: cloneGuidanceChanges(snapshot.lastChanges),
+  };
+}
+
+function isValidBriefMetadata(value) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && BRIEF_FIELDS.every(([key]) => isValidFieldSource(value.fieldSources?.[key]))
+    && isValidFieldKeyList(value.deferredFields)
+    && isValidGuidanceChanges(value.lastChanges);
+}
+
 function confirmedSnapshot(state) {
   if (state.brief.confirmedRevision === null) return null;
   const answers = state.brief.confirmedAnswers || state.brief.answers;
@@ -1348,15 +1407,15 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
   if (state?.schemaVersion === 2) {
     if (Object.hasOwn(state.brief || {}, 'confirmedAnswers')
       && Object.hasOwn(state.brief || {}, 'confirmedFieldSources')) {
-      return validateV2State(withGuidanceMetadata(
+      return validateV2State(releaseFailedActivationSession(withGuidanceMetadata(
         Object.hasOwn(state, 'runs') ? state : { ...state, runs: initialEvaluationRuns() },
-      ));
+      )));
     }
     const confirmedAnswers = state.brief?.confirmedRevision === null
       ? null
       : (state.brief.confirmedRevision === state.brief.revision ? state.brief.answers : recoveredAnswers);
     const confirmedFieldSources = confirmedAnswers ? cloneFieldSources(state.brief.fieldSources) : null;
-    return validateV2State(withGuidanceMetadata({
+    return validateV2State(releaseFailedActivationSession(withGuidanceMetadata({
       ...state,
       brief: {
         ...state.brief,
@@ -1364,7 +1423,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
         confirmedAnswers: confirmedAnswers ? { ...confirmedAnswers } : null,
         confirmedFieldSources,
       },
-    }));
+    })));
   }
   validateV1State(state);
   const answers = Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, key === 'examples' ? '' : state.brief.answers[key]]));
@@ -1396,7 +1455,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
     createdAt: dispatch.createdAt,
     updatedAt: dispatch.updatedAt,
   } : null;
-  return validateV2State({
+  return validateV2State(releaseFailedActivationSession({
     schemaVersion: 2,
     stateVersion: state.stateVersion,
     projectName: state.projectName,
@@ -1422,7 +1481,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
     runs: initialEvaluationRuns(),
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
-  });
+  }));
 }
 
 function withGuidanceMetadata(state) {
@@ -1439,6 +1498,19 @@ function withGuidanceMetadata(state) {
       lastChanges: brief.lastChanges || emptyGuidanceChanges(),
     },
   };
+}
+
+function releaseFailedActivationSession(state) {
+  if (state.work?.activation?.status !== 'failed'
+    || state.work.activeRevision !== null
+    || state.work.sessionId === null) return state;
+  return { ...state, work: { ...state.work, sessionId: null } };
+}
+
+function failedActivationBelongsToAnotherSession(state, request) {
+  return state.work.activation?.briefRevision === request.briefRevision
+    && state.work.activation.status === 'failed'
+    && state.work.activation.sessionId !== request.sessionId;
 }
 
 function validateV1State(state) {
@@ -1505,7 +1577,9 @@ function validateV2State(state) {
   if (activation !== null && (!activation || typeof activation.id !== 'string'
     || !Number.isInteger(activation.briefRevision) || activation.briefRevision < 0
     || activation.briefRevision > state.brief.revision || typeof activation.sessionId !== 'string'
-    || activation.sessionId !== state.work.sessionId || !['pending', 'active', 'failed'].includes(activation.status)
+    || !['pending', 'active', 'failed'].includes(activation.status)
+    || (activation.status !== 'failed' && activation.sessionId !== state.work.sessionId)
+    || (activation.status === 'failed' && state.work.sessionId !== null && activation.sessionId !== state.work.sessionId)
     || !(activation.messageId === null || typeof activation.messageId === 'string')
     || !isActivationError(activation.error)
     || typeof activation.createdAt !== 'string' || typeof activation.updatedAt !== 'string'
@@ -1515,8 +1589,11 @@ function validateV2State(state) {
   if (activation?.status === 'pending') {
     if (!Object.hasOwn(activation, 'previousConfirmed')
       || !(activation.previousConfirmed === null || (isValidConfirmedSnapshot(activation.previousConfirmed)
-        && activation.previousConfirmed.revision <= state.brief.revision))) throw corruptState();
-  } else if (activation && Object.hasOwn(activation, 'previousConfirmed')) {
+        && activation.previousConfirmed.revision <= state.brief.revision))
+      || (Object.hasOwn(activation, 'previousBriefMetadata')
+        && !isValidBriefMetadata(activation.previousBriefMetadata))) throw corruptState();
+  } else if (activation && (Object.hasOwn(activation, 'previousConfirmed')
+    || Object.hasOwn(activation, 'previousBriefMetadata'))) {
     throw corruptState();
   }
   return state;

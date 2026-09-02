@@ -708,6 +708,11 @@ window.__ModuleLoader__.load({
       return ["review_and_confirm", "start_making", "activation_pending", "sync_changes", "retry_activation"]
         .includes(guidance?.next?.kind);
     }
+    function hasUnsavedBriefChanges(project, draft) {
+      if (typeof draft?.projectName === "string" && draft.projectName.trim() !== project.projectName) return true;
+      return fields.some(({ key }) => Object.hasOwn(draft?.answers || {}, key)
+        && String(draft.answers[key]).trim() !== (project.answers[key] || ""));
+    }
     function actionLabel(project, sessionId) {
       const guidance = project.guidance;
       if (guidanceReturnsToCanonical(guidance, project, sessionId)) return "返回制作会话";
@@ -797,6 +802,7 @@ window.__ModuleLoader__.load({
         try { await putProject(workspaceId, { projectName: value }, "projectName"); } catch {}
       };
       const canActivate = guidanceAllowsActivation(project.guidance);
+      const hasUnsavedChanges = hasUnsavedBriefChanges(project, record.draft);
       const returnToCanonical = guidanceReturnsToCanonical(project.guidance, project, sessionId);
       const canReturn = returnToCanonical || project.guidance?.next?.kind === "continue_making";
       const canRerun = project.work.sessionId === sessionId
@@ -834,9 +840,11 @@ window.__ModuleLoader__.load({
             h("div", null, h("dt", null, "写入范围"), h("dd", null, "仅当前项目；危险操作会先询问")),
             h("div", null, h("dt", null, "计划动作"), h("dd", null, "制作最小结果 → 用真实材料运行 → 按验收标准修正")))),
         !project.readiness.ready ? h("p", { className: "wx-readiness" }, "还需明确：", project.readiness.missingRequired.map((key) => fields.find((field) => field.key === key)?.label).filter(Boolean).join("、")) : null,
-        h("button", { type: "button", className: "wx-primary wx-activate", disabled: record.busy || (!canReturn && !canActivate), onClick: run }, record.busy ? "正在准备…" : actionLabel(project, sessionId)),
+        h("button", { type: "button", className: "wx-primary wx-activate", disabled: record.busy || (!canReturn && (hasUnsavedChanges || !canActivate)), onClick: run }, record.busy ? "正在准备…" : actionLabel(project, sessionId)),
         h("p", { className: "wx-activation-note" }, returnToCanonical
           ? "制作只在项目的主会话继续；先返回该对话，再确认并同步修改。"
+          : hasUnsavedChanges
+            ? "请先保存工作说明中的修改，再确认当前版本并开始制作。"
           : canActivate
             ? "点击后会原子确认当前工作说明，并在这个对话里开始制作。"
             : "补全四项制作条件后，可一次确认工作说明并开始制作。"));
@@ -1005,6 +1013,9 @@ window.__ModuleLoader__.load({
     async function activateProject(ctx, workspaceId, sessionId) {
       const record = recordFor(workspaceId);
       const hadActiveContract = Number.isInteger(record.project.work.activeRevision);
+      if (hasUnsavedBriefChanges(record.project, record.draft)) {
+        return replaceRecord(workspaceId, { error: "请先保存工作说明中的修改，再开始制作。" });
+      }
       if (!guidanceAllowsActivation(record.project.guidance)) return replaceRecord(workspaceId, { error: "请先补全目标、真实输入、交付物和验收标准。" });
       replaceRecord(workspaceId, { busy: true, error: "", errorCode: "", conflict: false });
       try {

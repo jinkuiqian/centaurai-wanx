@@ -182,6 +182,21 @@ test('v0.3.1 atomically confirms four complete essentials and reports brief tool
   assert.match(client, /"aria-live": "polite"/u);
 });
 
+test('v0.3 never activates a stale work description while visible edits are unsaved', () => {
+  const helperSource = client.match(/function hasUnsavedBriefChanges\(project, draft\) \{([\s\S]*?)\n    \}/u)?.[0];
+  assert.ok(helperSource, 'unsaved-change detection must be callable at the Client seam');
+  const fields = [{ key: 'goal' }, { key: 'inputs' }];
+  const hasUnsavedBriefChanges = new Function('fields', `return (${helperSource})`)(fields);
+  const project = { projectName: '客户周报', answers: { goal: '生成周报', inputs: 'CRM 导出' } };
+
+  assert.equal(hasUnsavedBriefChanges(project, { answers: {} }), false);
+  assert.equal(hasUnsavedBriefChanges(project, { projectName: '新名称', answers: {} }), true);
+  assert.equal(hasUnsavedBriefChanges(project, { answers: { goal: '生成风险周报' } }), true);
+  assert.equal(hasUnsavedBriefChanges(project, { answers: { goal: '生成周报' } }), false);
+  assert.match(client, /disabled: record\.busy \|\| \(!canReturn && \(hasUnsavedChanges \|\| !canActivate\)\)/u);
+  assert.match(client, /请先保存工作说明中的修改/u);
+});
+
 test('v0.3 themes the native shell through paired light and dark tokens', () => {
   assert.match(client, /theme\.overrideTokens/u);
   assert.match(client, /"--dsw-alias-bg-base": \{ light: "#F3F0E8", dark: "#151A18" \}/u);
