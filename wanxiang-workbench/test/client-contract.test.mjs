@@ -123,6 +123,10 @@ test('v0.3.1 imports external workspaces from the guidance dock and keeps other 
 
 test('v0.3.1 consumes the complete authoritative guidance snapshot with a legacy-only fallback', () => {
   assert.match(client, /const authoritativeGuidance = normalizeGuidance\(value\?\.guidance \|\| projection\?\.guidance\)/u);
+  assert.match(client, /raw\?\.schemaVersion !== 2/u);
+  assert.match(client, /Array\.isArray\(raw\.investigatedFields\)/u);
+  assert.match(client, /Array\.isArray\(raw\.changes\?\.confirmed\)/u);
+  assert.match(client, /\["member", "agent"\]\.includes\(raw\.next\?\.audience\)/u);
   assert.match(client, /const understanding = authoritativeGuidance\?\.understanding \|\| source/u);
   assert.match(client, /const derived = authoritativeGuidance \? null : deriveProjection\(project\)/u);
   assert.match(client, /guidance: authoritativeGuidance \|\| derived\.guidance/u);
@@ -132,6 +136,34 @@ test('v0.3.1 consumes the complete authoritative guidance snapshot with a legacy
   for (const kind of ['ask_field', 'review_and_confirm', 'start_making', 'activation_pending', 'continue_making', 'sync_changes', 'retry_activation']) {
     assert.match(client, new RegExp(`"${kind}"`, 'u'));
   }
+});
+
+test('v0.3.1 renders this round\'s confirmed, inferred and unresolved understanding from Host guidance', () => {
+  const componentSource = client.match(/function GuidanceChanges\(\{ guidance \}\) \{([\s\S]*?)\n    \}\n    function GuidanceDock/u)?.[0]
+    ?.replace(/\n    function GuidanceDock$/u, '');
+  assert.ok(componentSource, 'GuidanceChanges component must be callable at the public Client seam');
+  const h = (type, props, ...children) => ({ type, props: props || {}, children: children.flat() });
+  const fieldByKey = {
+    goal: { label: '目标' },
+    inputs: { label: '真实输入' },
+    success: { label: '验收标准' },
+  };
+  const GuidanceChanges = new Function('h', 'fieldByKey', `return (${componentSource})`)(h, fieldByKey);
+  const view = GuidanceChanges({
+    guidance: {
+      changes: { confirmed: ['goal'], inferred: ['inputs'], unresolved: ['success'] },
+      understanding: { answers: { goal: '生成周报', inputs: 'CRM 导出', success: '' } },
+    },
+  });
+  const visibleText = (node) => typeof node === 'string' ? node : (node?.children || []).map(visibleText).join('');
+
+  assert.equal(view.type, 'section');
+  assert.equal(view.props['aria-live'], 'polite');
+  assert.equal(visibleText(view), '本轮新增已确认目标生成周报本轮新增已推断真实输入CRM 导出本轮仍待确认验收标准仍待补充');
+  assert.match(client, /h\(GuidanceChanges, \{ guidance \}\)/u);
+  assert.match(client, /guidance\.next\.audience === "agent"/u);
+  assert.match(client, /万象正在只读检查/u);
+  assert.match(client, /不知道\|暂时不知道\|稍后补充\|之后补充/u);
 });
 
 test('v0.3.1 atomically confirms four complete essentials and reports brief tool progress', () => {

@@ -63,7 +63,7 @@ window.__ModuleLoader__.load({
     }
     function isPlaceholderAnswer(value) {
       const text = String(value || "").trim();
-      return !text || /^(?:待在.+继续确认|待补充|待填写|待确认|未填写|todo|n\/a)$/iu.test(text);
+      return !text || /^(?:待在.+继续确认|待补充|待填写|待确认|未填写|不知道|暂时不知道|稍后补充|之后补充|todo|n\/a)$/iu.test(text);
     }
     function fieldSourceObject(source, answers, key = "fieldSources") {
       const raw = source?.brief?.[key] || source?.[key] || {};
@@ -91,18 +91,25 @@ window.__ModuleLoader__.load({
       const deferredFields = fields.filter((field) => !field.required && (!known(field.key)
         || project.fieldSources[field.key]?.status === "unresolved")).map(({ key }) => key);
       const activation = project.work.activation;
-      const result = (stage, kind, field, prompt) => ({ stage, progress, deferredFields, next: { kind, field, prompt } });
-      if (activation?.status === "pending") return result("activating", "activation_pending", null, "万象正在安全切换到制作状态，请等待当前操作完成。");
-      if (activation?.status === "failed" && activation.briefRevision === project.briefRevision) return result("failed", "retry_activation", null, "上次开始制作没有完成，请检查失败原因后重试。");
-      if (Number.isInteger(project.work.activeRevision) && project.briefRevision > project.work.activeRevision) return result("changed", "sync_changes", null, "工作说明已有修改，请确认同步后继续制作。");
-      if (Number.isInteger(project.work.activeRevision) && project.work.activeRevision === project.briefRevision) return result("making", "continue_making", null, "工作说明已经生效，请继续制作并用真实材料验证。");
+      const result = (stage, kind, field, audience, prompt) => ({
+        stage,
+        progress,
+        deferredFields,
+        investigatedFields: [],
+        changes: { confirmed: [], inferred: [], unresolved: [] },
+        next: { kind, field, audience, prompt },
+      });
+      if (activation?.status === "pending") return result("activating", "activation_pending", null, null, "万象正在安全切换到制作状态，请等待当前操作完成。");
+      if (activation?.status === "failed" && activation.briefRevision === project.briefRevision) return result("failed", "retry_activation", null, null, "上次开始制作没有完成，请检查失败原因后重试。");
+      if (Number.isInteger(project.work.activeRevision) && project.briefRevision > project.work.activeRevision) return result("changed", "sync_changes", null, null, "工作说明已有修改，请确认同步后继续制作。");
+      if (Number.isInteger(project.work.activeRevision) && project.work.activeRevision === project.briefRevision) return result("making", "continue_making", null, null, "工作说明已经生效，请继续制作并用真实材料验证。");
       const nextField = requiredKeys.find((key) => !known(key));
-      if (nextField) return result("understanding", "ask_field", nextField, guidanceQuestions[nextField]);
-      if (requiredKeys.some((key) => !confirmed(key))) return result("reviewing", "review_and_confirm", null, "请打开工作说明，核对制作前的四项关键内容；有误直接修改，确认无误后再开始制作。");
-      return result("ready", "start_making", null, "工作说明已经确认，可以在当前对话中开始制作。");
+      if (nextField) return result("understanding", "ask_field", nextField, "member", guidanceQuestions[nextField]);
+      if (requiredKeys.some((key) => !confirmed(key))) return result("reviewing", "review_and_confirm", null, null, "请打开工作说明，核对制作前的四项关键内容；有误直接修改，确认无误后再开始制作。");
+      return result("ready", "start_making", null, null, "工作说明已经确认，可以在当前对话中开始制作。");
     }
     function normalizeGuidance(raw) {
-      if (raw?.schemaVersion !== 1
+      if (raw?.schemaVersion !== 2
         || !Number.isInteger(raw.stateVersion)
         || !Number.isInteger(raw.briefRevision)
         || typeof raw.stage !== "string"
@@ -111,7 +118,12 @@ window.__ModuleLoader__.load({
         || !raw.progress
         || !Array.isArray(raw.unresolvedFields)
         || !Array.isArray(raw.deferredFields)
+        || !Array.isArray(raw.investigatedFields)
+        || !Array.isArray(raw.changes?.confirmed)
+        || !Array.isArray(raw.changes?.inferred)
+        || !Array.isArray(raw.changes?.unresolved)
         || typeof raw.next?.kind !== "string"
+        || !(raw.next?.audience === null || ["member", "agent"].includes(raw.next?.audience))
         || typeof raw.next?.prompt !== "string") return null;
       return raw;
     }
@@ -493,6 +505,21 @@ window.__ModuleLoader__.load({
           "data-required": field.required || undefined,
         }))));
     }
+    function GuidanceChanges({ guidance }) {
+      const groups = [
+        ["confirmed", "本轮新增已确认"],
+        ["inferred", "本轮新增已推断"],
+        ["unresolved", "本轮仍待确认"],
+      ].map(([key, label]) => ({ key, label, fields: guidance.changes?.[key] || [] }))
+        .filter((group) => group.fields.length);
+      if (!groups.length) return null;
+      return h("section", { className: "wx-guidance-changes", "aria-live": "polite", "aria-label": "本轮理解变化" },
+        groups.map((group) => h("div", { key: group.key, "data-change": group.key },
+          h("strong", null, group.label),
+          h("ul", null, group.fields.map((key) => h("li", { key },
+            h("span", null, fieldByKey[key]?.label || key),
+            h("small", null, guidance.understanding?.answers?.[key] || "仍待补充")))))));
+    }
     function GuidanceDock({ session, sessionId, input, inputActions }) {
       const id = sessionId || session.sessionId;
       const workspace = useWorkspace(id);
@@ -508,6 +535,7 @@ window.__ModuleLoader__.load({
       const guidanceContentId = React.useId();
       const draftText = typeof input?.draft === "string" ? input.draft : "";
       const canPrefill = !firstTurnPending && !draftText.trim() && typeof inputActions?.setDraft === "function";
+      const nextKicker = guidance.next.audience === "agent" ? "万象正在只读检查" : "下一步";
       React.useEffect(() => {
         setCollapsed(["making", "activating"].includes(stage));
         setPrefilled(false);
@@ -604,7 +632,8 @@ window.__ModuleLoader__.load({
           collapsible ? h("button", { type: "button", className: "wx-guidance-link", onClick: () => setCollapsed(true), "aria-expanded": "true", "aria-controls": guidanceContentId }, "收起") : null),
         h("div", { id: guidanceContentId, className: "wx-guidance-body" },
           h(GuidanceProgress, { guidance, answers: project.answers }),
-          h("p", { className: "wx-guidance-next" }, h("span", null, "下一步"), guidance.next.prompt),
+          h(GuidanceChanges, { guidance }),
+          h("p", { className: "wx-guidance-next" }, h("span", null, nextKicker), guidance.next.prompt),
           h("button", { type: "button", className: "wx-guidance-brief", onClick: runGuidanceAction }, h(Icon, { name: "brief", size: 15 }), guidanceActionLabel(guidance, project, id))));
     }
     function statusOf(record) {
@@ -1142,6 +1171,7 @@ window.__ModuleLoader__.load({
         .wx-brand{font:650 19px/1 ui-serif,"Songti SC","STSong",serif;letter-spacing:.12em}.wx-side{box-sizing:border-box;width:100%;min-height:40px;display:flex;align-items:center;gap:10px;padding:8px 10px;border:0;border-radius:12px;background:transparent;color:inherit;font:inherit;cursor:pointer;transition:background-color .14s ease}.wx-side:hover{background:var(--dsw-alias-interactive-bg-hover)}.wx-side>svg{flex:0 0 18px}
         .wx-guidance-sync{min-height:40px;padding:8px 11px;display:flex;align-items:center;gap:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 88%,transparent);color:var(--dsw-alias-label-tertiary);font-size:11px}.wx-guidance-sync .wx-guidance-link{margin-left:auto}
         .wx-guidance{box-sizing:border-box;width:min(760px,100%);margin:0 auto;color:var(--dsw-alias-label-primary);font-family:var(--ds-font-family-text,ui-sans-serif,system-ui)}.wx-guidance-empty{padding:20px;border:1px solid var(--dsw-alias-border-l2);border-radius:18px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 90%,transparent);box-shadow:0 12px 34px rgba(20,31,27,.07);text-align:left}.wx-guidance-kicker{display:flex;align-items:center;gap:8px;color:var(--dsw-alias-state-business-primary);font:650 11px/16px var(--ds-font-family-code,ui-monospace,monospace);letter-spacing:.08em}.wx-guidance-empty h2{max-width:650px;margin:13px 0 7px;font:560 23px/1.38 ui-serif,"Songti SC","STSong",serif}.wx-guidance-intro{max-width:650px;margin:0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:1.7}.wx-guidance-steps{list-style:none;margin:17px 0 0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}.wx-guidance-steps li{min-width:0;display:flex;align-items:flex-start;gap:8px;padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-base)}.wx-guidance-steps li>span{width:20px;height:20px;flex:none;display:grid;place-items:center;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent);color:var(--dsw-alias-state-business-primary);font:650 10px/20px var(--ds-font-family-code,ui-monospace,monospace)}.wx-guidance-steps strong,.wx-guidance-steps small{display:block}.wx-guidance-steps strong{font-size:11px;line-height:1.45}.wx-guidance-steps small{margin-top:3px;color:var(--dsw-alias-label-tertiary);font-size:9px;line-height:1.45}.wx-guidance-question{margin:15px 0 0;color:var(--dsw-alias-label-primary);font:500 13px/1.6 var(--ds-font-family-text,ui-sans-serif,system-ui)}.wx-guidance-question span{display:block;margin-bottom:2px;color:var(--dsw-alias-state-business-primary);font:650 10px/15px var(--ds-font-family-code,ui-monospace,monospace);letter-spacing:.08em}.wx-guidance-examples{margin-top:11px;display:flex;flex-wrap:wrap;gap:7px}.wx-guidance-examples button{padding:6px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:500 11px/17px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer;transition:border-color .14s ease,background-color .14s ease,color .14s ease}.wx-guidance-examples button:hover:not(:disabled){border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 8%,transparent);color:var(--dsw-alias-state-business-primary)}.wx-guidance-examples button:disabled{opacity:.45;cursor:default}.wx-guidance-prefill{margin:8px 0 0;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:1.5}.wx-guidance-active,.wx-guidance-compact{border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 88%,transparent)}.wx-guidance-active{padding:13px 14px}.wx-guidance[data-tone=problem]{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 42%,var(--dsw-alias-border-l2));background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 6%,var(--dsw-alias-bg-layer-1))}.wx-guidance[data-tone=attention]{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 34%,var(--dsw-alias-border-l2))}.wx-guidance-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.wx-guidance-head>div,.wx-guidance-compact-main{min-width:0;display:flex;align-items:center;gap:8px}.wx-guidance-head strong,.wx-guidance-compact-main>strong{font:560 13px/19px ui-serif,"Songti SC","STSong",serif}.wx-guidance-dot{width:7px;height:7px;flex:none;border-radius:999px;background:var(--dsw-alias-label-caption)}.wx-guidance[data-tone=active] .wx-guidance-dot{background:var(--dsw-alias-state-business-primary)}.wx-guidance[data-tone=attention] .wx-guidance-dot{background:var(--dsw-alias-state-warn-primary)}.wx-guidance[data-tone=problem] .wx-guidance-dot{background:var(--dsw-alias-state-error-primary)}.wx-guidance-link{flex:none;border:0;padding:3px 2px;background:transparent;color:var(--dsw-alias-label-tertiary);font:500 10px/16px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer}.wx-guidance-link:hover{color:var(--dsw-alias-state-business-primary)}.wx-guidance-progress{margin-top:9px;display:grid;grid-template-columns:max-content max-content minmax(80px,1fr);align-items:center;gap:9px;color:var(--dsw-alias-label-tertiary);font:500 10px/15px var(--ds-font-family-code,ui-monospace,monospace)}.wx-guidance-progress strong{color:var(--dsw-alias-label-secondary);font-weight:650}.wx-guidance-meter{min-width:0;display:grid;grid-template-columns:repeat(7,minmax(5px,1fr));gap:3px}.wx-guidance-meter i{height:3px;border-radius:999px;background:var(--dsw-alias-border-l2)}.wx-guidance-meter i[data-known]{background:var(--dsw-alias-state-business-primary)}.wx-guidance-next{margin:10px 0 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:1.55}.wx-guidance-next span{margin-right:7px;color:var(--dsw-alias-state-business-primary);font:650 9px/14px var(--ds-font-family-code,ui-monospace,monospace);letter-spacing:.06em}.wx-guidance-brief{margin-top:10px;display:inline-flex;align-items:center;gap:6px;padding:6px 9px;border:1px solid var(--dsw-alias-border-l2);border-radius:9px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-state-business-primary);font:600 11px/17px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer}.wx-guidance-compact{min-height:40px;padding:7px 10px;display:flex;align-items:center;justify-content:space-between;gap:10px}.wx-guidance-compact-main{flex:1}.wx-guidance-compact .wx-guidance-progress{flex:1;margin:0 0 0 5px;grid-template-columns:max-content max-content minmax(52px,1fr)}.wx-model-inline{box-sizing:border-box;width:100%;margin-top:13px;padding:9px 11px;display:flex;align-items:center;justify-content:space-between;gap:12px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-warn-primary) 35%,var(--dsw-alias-border-l1));border-radius:11px;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 8%,transparent);color:var(--dsw-alias-label-secondary);font:400 11px/1.5 var(--ds-font-family-text,ui-sans-serif,system-ui);text-align:left}.wx-model-inline button{flex:none;border:0;background:transparent;color:var(--dsw-alias-state-business-primary);font:600 11px/18px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer}.wx-model-unknown{margin:10px 0 0;color:var(--dsw-alias-label-tertiary);font-size:11px}
+        .wx-guidance-changes{margin-top:10px;display:grid;gap:6px}.wx-guidance-changes>div{display:grid;grid-template-columns:110px minmax(0,1fr);gap:8px;align-items:start}.wx-guidance-changes>div>strong{color:var(--dsw-alias-label-tertiary);font:600 9px/16px var(--ds-font-family-code,ui-monospace,monospace)}.wx-guidance-changes ul{list-style:none;margin:0;padding:0;display:grid;gap:4px}.wx-guidance-changes li{min-width:0;display:flex;gap:6px;font-size:10px;line-height:1.5}.wx-guidance-changes li>span{flex:none;color:var(--dsw-alias-label-secondary);font-weight:600}.wx-guidance-changes li>small{min-width:0;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wx-guidance-changes [data-change=confirmed]>strong{color:var(--dsw-alias-state-business-primary)}.wx-guidance-changes [data-change=inferred]>strong{color:var(--dsw-alias-state-warn-primary)}
         .wx-badge{display:inline-flex;align-items:center;gap:7px;min-height:30px;padding:5px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:500 12px/18px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer;transition:background-color .14s ease,border-color .14s ease}.wx-badge:hover{background:var(--dsw-alias-interactive-bg-hover)}.wx-badge[data-tone=active]{border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 42%,var(--dsw-alias-border-l2));color:var(--dsw-alias-state-business-primary)}.wx-badge[data-tone=attention]{color:var(--dsw-alias-state-warn-primary)}.wx-badge[data-tone=problem]{color:var(--dsw-alias-state-error-primary)}
         .wx-backdrop{pointer-events:auto;position:fixed;inset:0;border:0;background:rgba(14,20,18,.34);backdrop-filter:blur(2px);animation:wx-fade-in .16s ease both}.wx-drawer{pointer-events:auto;box-sizing:border-box;position:fixed;z-index:2;inset:0 0 0 auto;width:min(420px,calc(100vw - 24px));padding:26px 24px 36px;overflow:auto;overscroll-behavior:contain;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-left:1px solid var(--dsw-alias-border-l2);box-shadow:-20px 0 56px rgba(13,24,20,.18);font-family:var(--ds-font-family-text,ui-sans-serif,system-ui);animation:wx-drawer-in .16s ease-out both;outline:none}.wx-drawer :is(button,input,textarea):focus-visible,.wx-guidance button:focus-visible,.wx-side:focus-visible,.wx-badge:focus-visible,.wx-model-inline button:focus-visible,.wx-tool-brief button:focus-visible,.wx-rerun:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}.wx-close{position:absolute;top:16px;right:16px;width:36px;height:36px;display:grid;place-items:center;border:0;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}.wx-close:hover{background:var(--dsw-alias-interactive-bg-hover)}
         .wx-panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-right:40px;margin-bottom:18px}.wx-panel-head p,.wx-community-head p{margin:0 0 4px;color:var(--dsw-alias-state-business-primary);font:650 10px/15px var(--ds-font-family-code,ui-monospace,monospace);letter-spacing:.12em;text-transform:uppercase}.wx-panel-head h2,.wx-community-head h2{margin:0;font:560 28px/1.25 ui-serif,"Songti SC","STSong",serif}.wx-panel-status{flex:none;margin-top:4px;padding:4px 8px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:11px}.wx-panel-status[data-tone=active]{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent);color:var(--dsw-alias-state-business-primary)}.wx-panel-status[data-tone=problem]{color:var(--dsw-alias-state-error-primary)}.wx-project-name{display:block;margin-bottom:14px;color:var(--dsw-alias-label-tertiary);font-size:11px}.wx-project-name input{box-sizing:border-box;width:100%;height:38px;margin-top:6px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:500 13px/20px var(--ds-font-family-text,ui-sans-serif,system-ui);outline:none}.wx-project-name input:focus,.wx-brief-field textarea:focus,.wx-community-input:focus{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent)}

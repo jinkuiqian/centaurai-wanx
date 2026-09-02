@@ -43,7 +43,7 @@ const manifest = JSON.stringify({
 const favicon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="18" fill="#2f6656"/><path d="M18 19h8v8h12v-8h8v26h-8V35H26v10h-8z" fill="#fffaf0"/><circle cx="32" cy="32" r="4" fill="#d4a964"/></svg>`;
 const discoveryPolicy = `You are Wanxiang, helping a non-technical member turn one real, recurring job into a dependable work capability.
 
-You are currently understanding the work. Continue the normal conversation from the user's first message. Follow the single next action in the Wanxiang work-description context. Before the user-visible reply, use wanxiang_update_work_brief for every field made more precise by the latest message or inspected material. Then summarize what you now understand in one or two sentences. If the next action is ask_field, ask only its one supplied question and no second question. For every other next action, do not invent another discovery question; explain the supplied action in plain language. Clearly distinguish what the user confirmed from what you inferred.
+You are currently understanding the work. Continue the normal conversation from the user's first message. Follow the single next action in the Wanxiang work-description context. Before the user-visible reply, use wanxiang_update_work_brief for every field made more precise by the latest message or inspected material. Mark fields stated explicitly by the user as confirmedFields; leave your interpretation as inferred; when the user says they do not know or will answer later, use unresolvedFields instead of saving those words as an answer. If the next action is inspect_context, use only the allowed read-only tools and then report investigatedFields, even when nothing useful was found. Then summarize what you now understand in one or two sentences. If the next action is ask_field, ask only its one supplied question and no second question. For every other next action, do not invent another discovery question; explain the supplied action in plain language. Clearly distinguish what the user confirmed from what you inferred.
 
 This phase is read-only. You may inspect user-selected local material and public web pages, but you must not edit project files, send messages, use logged-in browser actions, or create external side effects. Do not claim that you have started making the solution. The user starts that explicitly from the work-description panel.`;
 
@@ -472,6 +472,24 @@ export function createWorkBriefTool(service) {
           }])),
           description: 'Only fields whose meaning changed. Do not repeat unchanged fields.',
         },
+        confirmedFields: {
+          type: 'array',
+          items: { type: 'string', enum: BRIEF_FIELDS.map(([key]) => key) },
+          uniqueItems: true,
+          description: 'Fields in patch whose content the user stated explicitly. Every other patched field remains an Agent inference.',
+        },
+        unresolvedFields: {
+          type: 'array',
+          items: { type: 'string', enum: BRIEF_FIELDS.map(([key]) => key) },
+          uniqueItems: true,
+          description: 'Fields the user explicitly does not know or wants to provide later. Do not put “unknown” or “later” in patch.',
+        },
+        investigatedFields: {
+          type: 'array',
+          items: { type: 'string', enum: BRIEF_FIELDS.map(([key]) => key) },
+          uniqueItems: true,
+          description: 'Fields for which the requested read-only project or environment investigation has completed, whether or not it found an answer.',
+        },
         reason: {
           type: 'string',
           description: 'A short explanation of what new conversation evidence changed the description.',
@@ -495,17 +513,59 @@ export function createWorkBriefTool(service) {
     },
     async execute(args, execution) {
       const input = requireObject(args, '工作说明工具参数无效。');
-      rejectUnknownKeys(input, ['baseStateVersion', 'patch', 'reason'], '工作说明工具参数');
+      rejectUnknownKeys(input, [
+        'baseStateVersion', 'patch', 'confirmedFields', 'unresolvedFields', 'investigatedFields', 'reason',
+      ], '工作说明工具参数');
       const baseVersion = nonNegativeInteger(input.baseStateVersion, '基础版本', 1);
-      const requestedAnswers = validateAnswerPatch(input.patch, { requireNonEmpty: true });
+      const rawAnswers = validateAnswerPatch(input.patch);
+      const confirmedFields = validateFieldKeyArray(input.confirmedFields || [], '用户确认字段');
+      const unresolvedFields = validateFieldKeyArray(input.unresolvedFields || [], '暂不确定字段');
+      const investigatedFields = validateFieldKeyArray(input.investigatedFields || [], '已调查字段');
+      const deferredFromPatch = Object.entries(rawAnswers)
+        .filter(([, value]) => /^(?:不知道|暂时不知道|稍后补充|之后补充)$/u.test(value))
+        .map(([key]) => key);
+      const deferred = [...new Set([...unresolvedFields, ...deferredFromPatch])];
+      const requestedAnswers = Object.fromEntries(Object.entries(rawAnswers)
+        .filter(([key]) => !deferred.includes(key)));
+      if (confirmedFields.some((key) => !Object.hasOwn(requestedAnswers, key))) {
+        throw serviceError(400, 'invalid_request', '用户确认字段必须同时出现在工作说明补丁中。');
+      }
+      if (deferred.some((key) => Object.hasOwn(requestedAnswers, key))) {
+        throw serviceError(400, 'invalid_request', '暂不确定字段不能同时保存为确定答案。');
+      }
+      if (!Object.keys(requestedAnswers).length && !deferred.length && !investigatedFields.length) {
+        throw serviceError(400, 'empty_patch', '至少更新一项工作说明、暂不确定状态或调查状态。');
+      }
       if (input.reason !== undefined) optionalText(input.reason, '更新原因', 1_000);
       const before = await service.contextForAgent(execution.agent);
       if (!before?.state) {
         throw serviceError(403, 'agent_workspace_unavailable', '当前对话不能更新这个项目的工作说明。');
       }
-      const answers = Object.fromEntries(Object.entries(requestedAnswers)
-        .filter(([key, value]) => before.state.brief.answers[key] !== value));
-      if (!Object.keys(answers).length && before.state.stateVersion === baseVersion) {
+      const desiredSources = Object.fromEntries(Object.keys(requestedAnswers).map((key) => [key, {
+        status: confirmedFields.includes(key) ? 'user_confirmed' : 'inferred',
+        sourceMessageIds: [],
+      }]));
+      const answers = Object.fromEntries(Object.entries(requestedAnswers).filter(([key, value]) => (
+        before.state.brief.answers[key] !== value
+      )));
+      const fieldSources = Object.fromEntries(Object.entries(desiredSources).filter(([key, value]) => (
+        before.state.brief.answers[key] !== requestedAnswers[key]
+          || sourceRank(value.status) > sourceRank(before.state.brief.fieldSources[key]?.status)
+      )));
+      const deferredChanges = deferred.filter((key) => (
+        !(before.state.brief.deferredFields || []).includes(key)
+          || before.state.brief.answers[key]
+          || before.state.brief.fieldSources[key]?.status !== 'unresolved'
+      ));
+      const investigationChanges = investigatedFields.filter((key) => (
+        !(before.state.brief.investigatedFields || []).includes(key)
+      ));
+      const unchangedRound = !Object.keys(answers).length && !Object.keys(fieldSources).length
+        && !deferredChanges.length && !investigationChanges.length
+        && before.state.stateVersion === baseVersion;
+      const hasPreviousChanges = Object.values(before.state.brief.lastChanges || {})
+        .some((fields) => Array.isArray(fields) && fields.length > 0);
+      if (unchangedRound && !hasPreviousChanges) {
         const projection = deriveProjectState(before.state);
         return {
           ok: true,
@@ -518,15 +578,17 @@ export function createWorkBriefTool(service) {
           updatedFields: [],
         };
       }
-      const fieldSources = Object.fromEntries(Object.keys(answers).map((key) => [key, {
-        status: 'inferred',
-        sourceMessageIds: [],
-      }]));
       try {
         const { workspaceId, state } = await service.updateProjectForAgent(
           execution.agent,
           baseVersion,
-          { answers, fieldSources },
+          {
+            answers,
+            fieldSources,
+            ...(deferredChanges.length ? { deferredFields: deferredChanges } : {}),
+            ...(investigationChanges.length ? { investigatedFields: investigationChanges } : {}),
+            ...(unchangedRound ? { consumeGuidanceChanges: true } : {}),
+          },
         );
         const projection = deriveProjectState(state);
         return {
@@ -537,7 +599,7 @@ export function createWorkBriefTool(service) {
           phase: projection.phase,
           readiness: projection.readiness,
           guidance: projection.guidance,
-          updatedFields: Object.keys(answers),
+          updatedFields: [...new Set([...Object.keys(answers), ...Object.keys(fieldSources), ...deferredChanges])],
         };
       } catch (error) {
         if (error?.statusCode === 409 && error?.current) {
@@ -745,6 +807,19 @@ function createAuthorizationTracker() {
 
 export async function discoveryToolAllowed(ctx, context, execution) {
   if (!DISCOVERY_TOOLS.has(execution.name)) return false;
+  if (execution.name === 'ask_user_question') {
+    const next = deriveProjectState(context.state).guidance.next;
+    const questions = execution.arguments?.questions;
+
+    return (
+      next.kind === 'ask_field' &&
+      next.audience === 'member' &&
+      Array.isArray(questions) &&
+      questions.length === 1 &&
+      typeof questions[0]?.question === 'string' &&
+      questions[0].question.trim() === next.prompt
+    );
+  }
   if (execution.name !== 'read' && execution.name !== 'read_image') return true;
   const filePath = execution.arguments?.file_path;
   if (typeof filePath !== 'string' || !filePath.trim()) return false;
@@ -790,6 +865,11 @@ export function renderPromptWorkDescription(state, projection, making) {
   const nextField = guide.next.field
     ? BRIEF_FIELDS.find(([key]) => key === guide.next.field)?.[1] || guide.next.field
     : '无';
+  const nextAudience = guide.next.audience === 'agent' ? '万象'
+    : guide.next.audience === 'member' ? '社群成员' : '无';
+  const changed = (keys) => keys.length
+    ? keys.map((key) => BRIEF_FIELDS.find(([field]) => field === key)?.[1] || key).join('、')
+    : '无';
   return `万象工作说明（stateVersion=${state.stateVersion}, briefRevision=${state.brief.revision}, phase=${projection.phase}）
 ${contract}
 
@@ -798,9 +878,13 @@ ${contract}
 - 当前阶段：${guide.stage}
 - 唯一下一步：${guide.next.kind}
 - 对应字段：${nextField}
+- 执行对象：${nextAudience}
 - 唯一引导语：${guide.next.prompt}
+- 本轮新增已确认：${changed(guide.changes.confirmed)}
+- 本轮新增已推断：${changed(guide.changes.inferred)}
+- 本轮仍待确认：${changed(guide.changes.unresolved)}
 - 制作中验证：${deferred}
-- 回复约束：先更新工作说明，再用 1–2 句复述当前理解；只有 ask_field 可以提问，并且只能询问上面的唯一问题。
+- 回复约束：先更新工作说明，再用 1–2 句复述当前理解；只有 ask_field 可以向用户提问，并且只能询问上面的唯一问题。
 
 ${fields}`;
 }
@@ -919,6 +1003,21 @@ function validateFieldSourcePatch(value) {
       sourceMessageIds: messageIds.map((messageId) => requiredText(messageId, '来源消息 ID', 500)),
     }];
   }));
+}
+
+function validateFieldKeyArray(value, label) {
+  if (!Array.isArray(value) || new Set(value).size !== value.length) {
+    throw serviceError(400, 'invalid_request', `${label}格式无效。`);
+  }
+  const known = new Set(BRIEF_FIELDS.map(([key]) => key));
+  if (value.some((key) => typeof key !== 'string' || !known.has(key))) {
+    throw serviceError(400, 'invalid_request', `${label}包含未知字段。`);
+  }
+  return value;
+}
+
+function sourceRank(status) {
+  return { unresolved: 0, inferred: 1, user_confirmed: 2 }[status] ?? -1;
 }
 
 function rejectUnknownKeys(value, allowed, label) {

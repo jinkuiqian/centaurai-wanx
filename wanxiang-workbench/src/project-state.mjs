@@ -18,10 +18,19 @@ export const FIELD_SOURCE_STATUSES = ['user_confirmed', 'inferred', 'unresolved'
 
 const GUIDANCE_QUESTIONS = {
   goal: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
-  inputs: '请上传或指出一份最近实际使用过的材料；如果不方便上传，请说明它的类型和关键内容。',
+  inputs: '这项工作实际会收到哪些业务材料或信息？项目中的文件位置和技术细节由万象自己检查。',
   output: '完成后你希望拿到什么交付物，以什么格式、给谁使用？',
   success: '用一份真实输入验收时，满足哪些可观察的条件就算可以使用？',
 };
+
+const GUIDANCE_RULES = [
+  { field: 'goal', dependsOn: [], inspectContext: false },
+  { field: 'inputs', dependsOn: ['goal'], inspectContext: true },
+  { field: 'output', dependsOn: ['goal'], inspectContext: false },
+  { field: 'success', dependsOn: ['goal', 'inputs', 'output'], inspectContext: false },
+];
+
+const INPUT_INSPECTION_PROMPT = '请先在当前项目和用户已选择的材料中查找实际输入的类型、位置和结构；只读检查后更新工作说明，不要把这些可查事实转问用户。';
 
 const SECTION_ALIASES = {
   goal: ['真实任务与目标', '目标', 'objective'],
@@ -54,6 +63,9 @@ export function createInitialState(projectName, timestamp = new Date().toISOStri
     brief: {
       answers: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, ''])),
       fieldSources: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, unresolvedFieldSource()])),
+      deferredFields: [],
+      investigatedFields: [],
+      lastChanges: emptyGuidanceChanges(),
       revision: 0,
       confirmedRevision: null,
       confirmedAnswers: null,
@@ -154,9 +166,15 @@ export function updateProjectState(current, update, timestamp = new Date().toISO
   const projectName = update.projectName ?? current.projectName;
   const answerPatch = validateAnswerPatch(update.answers || {});
   const sourcePatch = validateFieldSourcePatch(update.fieldSources || {});
+  const requestedDeferredFields = validateFieldKeyList(update.deferredFields || [], '工作说明暂缓字段无效。');
+  const requestedInvestigatedFields = validateFieldKeyList(update.investigatedFields || [], '工作说明调查字段无效。');
   const answers = { ...current.brief.answers, ...answerPatch };
   const fieldSources = { ...current.brief.fieldSources };
+  const deferredFields = new Set(current.brief.deferredFields || []);
+  const investigatedFields = new Set(current.brief.investigatedFields || []);
   for (const [key, value] of Object.entries(answerPatch)) {
+    if (isExplicitDeferral(value)) deferredFields.add(key);
+    else if (!isPlaceholder(value)) deferredFields.delete(key);
     if (!Object.hasOwn(sourcePatch, key) && current.brief.answers[key] !== value) {
       fieldSources[key] = isPlaceholder(value)
         ? unresolvedFieldSource()
@@ -164,14 +182,51 @@ export function updateProjectState(current, update, timestamp = new Date().toISO
     }
   }
   for (const [key, value] of Object.entries(sourcePatch)) {
+    if (isPlaceholder(answers[key])) {
+      fieldSources[key] = unresolvedFieldSource();
+      continue;
+    }
     const answerChanged = Object.hasOwn(answerPatch, key) && current.brief.answers[key] !== answers[key];
     if (!answerChanged && sourceStatusRank(value.status) < sourceStatusRank(current.brief.fieldSources[key].status)) continue;
     fieldSources[key] = value;
   }
-  const changed = current.projectName !== projectName
-    || BRIEF_FIELDS.some(([key]) => current.brief.answers[key] !== answers[key]
-      || !fieldSourcesEqual(current.brief.fieldSources[key], fieldSources[key]));
-  if (!changed) return current;
+  for (const key of requestedDeferredFields) {
+    answers[key] = '';
+    fieldSources[key] = unresolvedFieldSource();
+    deferredFields.add(key);
+  }
+  const goalChanged =
+    Object.hasOwn(answerPatch, 'goal')
+    && current.brief.answers.goal !== answers.goal;
+  const inputsChanged =
+    Object.hasOwn(answerPatch, 'inputs')
+    && current.brief.answers.inputs !== answers.inputs;
+  const invalidatedInferredInputs =
+    goalChanged
+    && investigatedFields.has('inputs')
+    && !Object.hasOwn(answerPatch, 'inputs')
+    && fieldSources.inputs.status === 'inferred';
+  if (goalChanged || inputsChanged) investigatedFields.delete('inputs');
+  if (invalidatedInferredInputs) {
+    answers.inputs = '';
+    fieldSources.inputs = unresolvedFieldSource();
+    deferredFields.delete('inputs');
+  }
+  for (const key of requestedInvestigatedFields) investigatedFields.add(key);
+  const orderedDeferredFields = orderedFieldKeys(deferredFields);
+  const orderedInvestigatedFields = orderedFieldKeys(investigatedFields);
+  const changedFields = BRIEF_FIELDS.map(([key]) => key).filter((key) => (
+    current.brief.answers[key] !== answers[key]
+      || !fieldSourcesEqual(current.brief.fieldSources[key], fieldSources[key])
+      || (current.brief.deferredFields || []).includes(key) !== deferredFields.has(key)
+  ));
+  const briefChanged = current.projectName !== projectName
+    || changedFields.length > 0
+    || !fieldKeyListsEqual(current.brief.investigatedFields || [], orderedInvestigatedFields);
+  const guidanceChangesConsumed = update.consumeGuidanceChanges === true
+    && Object.values(current.brief.lastChanges || emptyGuidanceChanges())
+      .some((fields) => fields.length > 0);
+  if (!briefChanged && !guidanceChangesConsumed) return current;
   return {
     ...current,
     stateVersion: current.stateVersion + 1,
@@ -180,7 +235,10 @@ export function updateProjectState(current, update, timestamp = new Date().toISO
       ...current.brief,
       answers,
       fieldSources,
-      revision: current.brief.revision + 1,
+      deferredFields: orderedDeferredFields,
+      investigatedFields: orderedInvestigatedFields,
+      lastChanges: classifyGuidanceChanges(changedFields, fieldSources),
+      revision: current.brief.revision + (briefChanged ? 1 : 0),
     },
     updatedAt: timestamp,
   };
@@ -212,6 +270,11 @@ export function confirmProjectState(current, briefRevision, timestamp = new Date
     brief: {
       ...current.brief,
       fieldSources,
+      deferredFields: (current.brief.deferredFields || []).filter((key) => isPlaceholder(current.brief.answers[key])),
+      lastChanges: classifyGuidanceChanges(
+        BRIEF_FIELDS.map(([key]) => key).filter((key) => !fieldSourcesEqual(current.brief.fieldSources[key], fieldSources[key])),
+        fieldSources,
+      ),
       confirmedRevision: briefRevision,
       confirmedAnswers: { ...current.brief.answers },
       confirmedFieldSources: cloneFieldSources(fieldSources),
@@ -221,14 +284,13 @@ export function confirmProjectState(current, briefRevision, timestamp = new Date
 }
 
 export function deriveReadiness(state) {
-  const missingRequired = REQUIRED_BRIEF_FIELDS.filter((key) => isPlaceholder(state.brief.answers[key]));
-  const unresolvedOptional = OPTIONAL_BRIEF_FIELDS.filter((key) => isPlaceholder(state.brief.answers[key])
-    || state.brief.fieldSources[key]?.status === 'unresolved');
+  const missingRequired = REQUIRED_BRIEF_FIELDS.filter((key) => !fieldResolved(state, key));
+  const unresolvedOptional = OPTIONAL_BRIEF_FIELDS.filter((key) => !fieldResolved(state, key));
   return { ready: missingRequired.length === 0, missingRequired, unresolvedOptional };
 }
 
 export function deriveGuidance(state) {
-  const known = (key) => !isPlaceholder(state.brief.answers[key]);
+  const known = (key) => fieldResolved(state, key);
   const confirmed = (key) => known(key) && state.brief.fieldSources[key]?.status === 'user_confirmed';
   const progress = {
     requiredKnown: REQUIRED_BRIEF_FIELDS.filter(known).length,
@@ -237,47 +299,60 @@ export function deriveGuidance(state) {
     allKnown: BRIEF_FIELDS.filter(([key]) => known(key)).length,
     allTotal: BRIEF_FIELDS.length,
   };
-  const deferredFields = OPTIONAL_BRIEF_FIELDS.filter((key) => isPlaceholder(state.brief.answers[key])
-    || state.brief.fieldSources[key]?.status === 'unresolved');
+  const explicitlyDeferred = new Set(state.brief.deferredFields || []);
+  const deferredFields = BRIEF_FIELDS.map(([key]) => key).filter((key) => (
+    explicitlyDeferred.has(key) || (OPTIONAL_BRIEF_FIELDS.includes(key) && !known(key))
+  ));
+  const investigatedFields = orderedFieldKeys(new Set(state.brief.investigatedFields || []));
   const activation = state.work.activation;
-  const result = (...args) => guidance(state, progress, deferredFields, ...args);
+  const result = (...args) => guidance(state, progress, deferredFields, investigatedFields, ...args);
 
   if (activation?.status === 'pending') {
-    return result('activating', 'activation_pending', null,
+    return result('activating', 'activation_pending', null, null,
       '万象正在安全切换到制作状态，请等待当前操作完成。');
   }
   if (activation?.status === 'failed' && activation.briefRevision === state.brief.revision) {
-    return result('failed', 'retry_activation', null,
+    return result('failed', 'retry_activation', null, null,
       '上次开始制作没有完成，请检查失败原因后重试。');
   }
   if (state.work.activeRevision !== null && state.brief.revision > state.work.activeRevision) {
-    return result('changed', 'sync_changes', null,
+    return result('changed', 'sync_changes', null, null,
       '工作说明已有修改，请确认同步后继续制作。');
   }
   if (state.work.activeRevision !== null && state.work.activeRevision === state.brief.revision) {
-    return result('making', 'continue_making', null,
+    return result('making', 'continue_making', null, null,
       '工作说明已经生效，请继续制作并用真实材料验证。');
   }
 
-  const nextField = REQUIRED_BRIEF_FIELDS.find((key) => !known(key));
-  if (nextField) {
-    return result('understanding', 'ask_field', nextField,
-      GUIDANCE_QUESTIONS[nextField]);
+  const nextRule = GUIDANCE_RULES.find(({ field, dependsOn }) => (
+    !known(field) && !explicitlyDeferred.has(field) && dependsOn.every(known)
+  ));
+  if (nextRule) {
+    if (nextRule.inspectContext && !investigatedFields.includes(nextRule.field)) {
+      return result('understanding', 'inspect_context', nextRule.field, 'agent', INPUT_INSPECTION_PROMPT);
+    }
+    return result('understanding', 'ask_field', nextRule.field, 'member', GUIDANCE_QUESTIONS[nextRule.field]);
+  }
+  const unresolvedRequired = REQUIRED_BRIEF_FIELDS.find((key) => !known(key));
+  if (unresolvedRequired) {
+    const label = BRIEF_FIELDS.find(([key]) => key === unresolvedRequired)?.[1] || unresolvedRequired;
+    return result('understanding', 'await_required', unresolvedRequired, null,
+      `${label}仍待补充；准备好后可以直接在工作说明中更新，万象不会把未知内容当成事实。`);
   }
   if (REQUIRED_BRIEF_FIELDS.some((key) => !confirmed(key))) {
-    return result('reviewing', 'review_and_confirm', null,
+    return result('reviewing', 'review_and_confirm', null, null,
       '请打开工作说明，核对制作前的四项关键内容；有误直接修改，确认无误后再开始制作。');
   }
-  return result('ready', 'start_making', null,
+  return result('ready', 'start_making', null, null,
     '工作说明已经确认，可以在当前对话中开始制作。');
 }
 
-function guidance(state, progress, deferredFields, stage, kind, field, prompt) {
+function guidance(state, progress, deferredFields, investigatedFields, stage, kind, field, audience, prompt) {
   const unresolvedFields = BRIEF_FIELDS.map(([key]) => key).filter((key) => (
     isPlaceholder(state.brief.answers[key]) || state.brief.fieldSources[key]?.status === 'unresolved'
   ));
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     stateVersion: state.stateVersion,
     briefRevision: state.brief.revision,
     stage,
@@ -288,7 +363,9 @@ function guidance(state, progress, deferredFields, stage, kind, field, prompt) {
     progress,
     unresolvedFields,
     deferredFields,
-    next: { kind, field, prompt },
+    investigatedFields,
+    changes: cloneGuidanceChanges(state.brief.lastChanges || emptyGuidanceChanges()),
+    next: { kind, field, audience, prompt },
   };
 }
 
@@ -865,6 +942,41 @@ function unresolvedFieldSource() {
   return { status: 'unresolved', sourceMessageIds: [] };
 }
 
+function emptyGuidanceChanges() {
+  return { confirmed: [], inferred: [], unresolved: [] };
+}
+
+function cloneGuidanceChanges(value) {
+  return {
+    confirmed: [...value.confirmed],
+    inferred: [...value.inferred],
+    unresolved: [...value.unresolved],
+  };
+}
+
+function classifyGuidanceChanges(keys, fieldSources) {
+  const changes = emptyGuidanceChanges();
+  for (const key of keys) {
+    const status = fieldSources[key]?.status;
+    if (status === 'user_confirmed') changes.confirmed.push(key);
+    else if (status === 'inferred') changes.inferred.push(key);
+    else changes.unresolved.push(key);
+  }
+  return changes;
+}
+
+function fieldResolved(state, key) {
+  return !isPlaceholder(state.brief.answers[key]) && state.brief.fieldSources[key]?.status !== 'unresolved';
+}
+
+function orderedFieldKeys(keys) {
+  return BRIEF_FIELDS.map(([key]) => key).filter((key) => keys.has(key));
+}
+
+function fieldKeyListsEqual(left, right) {
+  return left.length === right.length && left.every((key, index) => key === right[index]);
+}
+
 function sourceStatusRank(status) {
   return { unresolved: 0, inferred: 1, user_confirmed: 2 }[status] ?? -1;
 }
@@ -897,6 +1009,27 @@ function validateFieldSourcePatch(value) {
     patch[key] = { status: source.status, sourceMessageIds: [...new Set(source.sourceMessageIds)] };
   }
   return patch;
+}
+
+function validateFieldKeyList(value, message) {
+  if (!Array.isArray(value)) throw serviceError(400, 'brief_patch_invalid', message);
+  const known = new Set(BRIEF_FIELDS.map(([key]) => key));
+  if (value.some((key) => typeof key !== 'string' || !known.has(key))) {
+    throw serviceError(400, 'brief_patch_invalid', message);
+  }
+  return orderedFieldKeys(new Set(value));
+}
+
+function isValidGuidanceChanges(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const groups = ['confirmed', 'inferred', 'unresolved'];
+  if (Object.keys(value).some((key) => !groups.includes(key))) return false;
+  const seen = new Set();
+  return groups.every((group) => Array.isArray(value[group]) && value[group].every((key) => {
+    if (!BRIEF_FIELDS.some(([field]) => field === key) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }));
 }
 
 function isValidFieldSource(value) {
@@ -1012,7 +1145,11 @@ function findSection(sections, aliases) {
 
 function isPlaceholder(value) {
   const text = String(value || '').trim();
-  return !text || /^(?:待在.+继续确认|待补充|待填写|待确认|未填写|todo|n\/a)$/iu.test(text);
+  return !text || /^(?:待在.+继续确认|待补充|待填写|待确认|未填写|不知道|暂时不知道|稍后补充|之后补充|todo|n\/a)$/iu.test(text);
+}
+
+function isExplicitDeferral(value) {
+  return /^(?:不知道|暂时不知道|稍后补充|之后补充)$/u.test(String(value || '').trim());
 }
 
 async function loadOrMigrate(workspace, timestamp, id, dataRoot, runtimeId) {
@@ -1211,13 +1348,15 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
   if (state?.schemaVersion === 2) {
     if (Object.hasOwn(state.brief || {}, 'confirmedAnswers')
       && Object.hasOwn(state.brief || {}, 'confirmedFieldSources')) {
-      return validateV2State(Object.hasOwn(state, 'runs') ? state : { ...state, runs: initialEvaluationRuns() });
+      return validateV2State(withGuidanceMetadata(
+        Object.hasOwn(state, 'runs') ? state : { ...state, runs: initialEvaluationRuns() },
+      ));
     }
     const confirmedAnswers = state.brief?.confirmedRevision === null
       ? null
       : (state.brief.confirmedRevision === state.brief.revision ? state.brief.answers : recoveredAnswers);
     const confirmedFieldSources = confirmedAnswers ? cloneFieldSources(state.brief.fieldSources) : null;
-    return validateV2State({
+    return validateV2State(withGuidanceMetadata({
       ...state,
       brief: {
         ...state.brief,
@@ -1225,7 +1364,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
         confirmedAnswers: confirmedAnswers ? { ...confirmedAnswers } : null,
         confirmedFieldSources,
       },
-    });
+    }));
   }
   validateV1State(state);
   const answers = Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, key === 'examples' ? '' : state.brief.answers[key]]));
@@ -1267,6 +1406,9 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
         key,
         isPlaceholder(answers[key]) ? unresolvedFieldSource() : { status: 'user_confirmed', sourceMessageIds: [] },
       ])),
+      deferredFields: [],
+      investigatedFields: [],
+      lastChanges: emptyGuidanceChanges(),
       revision: state.brief.revision,
       confirmedRevision: confirmedAnswers ? state.brief.confirmedRevision : null,
       confirmedAnswers: confirmedAnswers ? { ...confirmedAnswers } : null,
@@ -1281,6 +1423,22 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
   });
+}
+
+function withGuidanceMetadata(state) {
+  const brief = state.brief || {};
+  if (Object.hasOwn(brief, 'deferredFields')
+    && Object.hasOwn(brief, 'investigatedFields')
+    && Object.hasOwn(brief, 'lastChanges')) return state;
+  return {
+    ...state,
+    brief: {
+      ...brief,
+      deferredFields: brief.deferredFields || [],
+      investigatedFields: brief.investigatedFields || [],
+      lastChanges: brief.lastChanges || emptyGuidanceChanges(),
+    },
+  };
 }
 
 function validateV1State(state) {
@@ -1313,6 +1471,9 @@ function validateV2State(state) {
     || typeof state.projectName !== 'string' || !state.projectName.trim() || !state.brief || !state.work
     || !isEvaluationRuns(state.runs)
     || !Number.isInteger(state.brief.revision) || state.brief.revision < 0
+    || !isValidFieldKeyList(state.brief.deferredFields)
+    || !isValidFieldKeyList(state.brief.investigatedFields)
+    || !isValidGuidanceChanges(state.brief.lastChanges)
     || !(state.brief.confirmedRevision === null || (Number.isInteger(state.brief.confirmedRevision)
       && state.brief.confirmedRevision >= 0 && state.brief.confirmedRevision <= state.brief.revision))
     || (state.brief.confirmedRevision === null
@@ -1359,6 +1520,12 @@ function validateV2State(state) {
     throw corruptState();
   }
   return state;
+}
+
+function isValidFieldKeyList(value) {
+  if (!Array.isArray(value) || new Set(value).size !== value.length) return false;
+  const ordered = orderedFieldKeys(new Set(value));
+  return fieldKeyListsEqual(value, ordered);
 }
 
 function isEvaluationRuns(value) {

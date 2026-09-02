@@ -95,6 +95,7 @@ test('work-description tool derives the project from the calling root agent and 
   assert.equal(result.workspaceId, 'workspace-1');
   assert.equal(result.stateVersion, 2);
   assert.equal(result.ok, true);
+  assert.equal(result.guidance.next.kind, 'inspect_context');
   assert.equal(result.guidance.next.field, 'inputs');
   assert.equal(result.guidance.progress.requiredKnown, 1);
 });
@@ -104,6 +105,7 @@ test('work-description tool returns a structured current snapshot on CAS conflic
   current.stateVersion = 4;
   current.brief.revision = 2;
   current.brief.answers.goal = '最新目标';
+  current.brief.fieldSources.goal = { status: 'inferred', sourceMessageIds: ['message-1'] };
   const tool = createWorkBriefTool({
     async contextForAgent() { return { workspaceId: 'workspace-1', state: current }; },
     async updateProjectForAgent() {
@@ -120,29 +122,105 @@ test('work-description tool returns a structured current snapshot on CAS conflic
   assert.equal(result.current.stateVersion, 4);
   assert.equal(result.current.briefRevision, 2);
   assert.equal(result.current.answers.goal, '最新目标');
+  assert.equal(result.guidance.next.kind, 'inspect_context');
   assert.equal(result.guidance.next.field, 'inputs');
   assert.deepEqual(result.guidance, result.current.guidance);
 });
 
 test('work-description tool keeps confirmed provenance when the model repeats an unchanged value', async () => {
-  const state = createInitialState('客户周报');
-  state.brief.answers.goal = '生成客户周报';
-  state.brief.fieldSources.goal = { status: 'user_confirmed', sourceMessageIds: ['message-1'] };
+  let state = updateProjectState(createInitialState('客户周报'), {
+    answers: { goal: '生成客户周报' },
+    fieldSources: { goal: { status: 'user_confirmed', sourceMessageIds: ['message-1'] } },
+  });
   let writes = 0;
   const tool = createWorkBriefTool({
     async contextForAgent() { return { workspaceId: 'workspace-1', state }; },
-    async updateProjectForAgent() { writes += 1; },
+    async updateProjectForAgent(_agent, baseVersion, patch) {
+      assert.equal(baseVersion, state.stateVersion);
+      writes += 1;
+      state = updateProjectState(state, patch);
+      return { workspaceId: 'workspace-1', state };
+    },
   });
 
-  const result = await tool.execute({ baseStateVersion: 1, patch: { goal: '生成客户周报' } }, {
+  const result = await tool.execute({ baseStateVersion: state.stateVersion, patch: { goal: '生成客户周报' } }, {
     agent: { id: 'session-root', session: { header: {} } },
   });
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.updatedFields, []);
-  assert.equal(writes, 0);
+  assert.equal(writes, 1);
   assert.equal(state.brief.fieldSources.goal.status, 'user_confirmed');
+  assert.deepEqual(result.guidance.changes, { confirmed: [], inferred: [], unresolved: [] });
+  assert.deepEqual(createProjectResponse(state).guidance.changes, result.guidance.changes);
+  assert.equal(result.guidance.next.kind, 'inspect_context');
   assert.equal(result.guidance.next.field, 'inputs');
+});
+
+test('work-description tool separates explicit user answers, inference and deferred unknowns', async () => {
+  let state = createInitialState('客户周报');
+  const service = {
+    async contextForAgent() { return { workspaceId: 'workspace-1', state }; },
+    async updateProjectForAgent(_agent, baseVersion, patch) {
+      assert.equal(baseVersion, state.stateVersion);
+      state = updateProjectState(state, patch);
+      return { workspaceId: 'workspace-1', state };
+    },
+  };
+  const tool = createWorkBriefTool(service);
+  const agent = { id: 'session-root', session: { header: {} } };
+
+  const understood = await tool.execute({
+    baseStateVersion: state.stateVersion,
+    patch: { goal: '每周生成客户周报', output: 'Markdown 周报' },
+    confirmedFields: ['goal'],
+  }, { agent });
+  assert.deepEqual(understood.guidance.changes, {
+    confirmed: ['goal'], inferred: ['output'], unresolved: [],
+  });
+  assert.equal(state.brief.fieldSources.goal.status, 'user_confirmed');
+  assert.equal(state.brief.fieldSources.output.status, 'inferred');
+  assert.equal(understood.guidance.next.kind, 'inspect_context');
+
+  const deferred = await tool.execute({
+    baseStateVersion: state.stateVersion,
+    patch: {},
+    investigatedFields: ['inputs'],
+    unresolvedFields: ['inputs'],
+  }, { agent });
+  assert.deepEqual(deferred.guidance.changes, {
+    confirmed: [], inferred: [], unresolved: ['inputs'],
+  });
+  assert.equal(state.brief.fieldSources.inputs.status, 'unresolved');
+  assert.equal(deferred.guidance.next.kind, 'await_required');
+  assert.equal(deferred.guidance.next.audience, null);
+});
+
+test('work-description tool records completed read-only investigation before asking for business input', async () => {
+  let state = updateProjectState(createInitialState('客户周报'), {
+    answers: { goal: '每周生成客户周报' },
+    fieldSources: { goal: { status: 'user_confirmed', sourceMessageIds: [] } },
+  });
+  const tool = createWorkBriefTool({
+    async contextForAgent() { return { workspaceId: 'workspace-1', state }; },
+    async updateProjectForAgent(_agent, _baseVersion, patch) {
+      state = updateProjectState(state, patch);
+      return { workspaceId: 'workspace-1', state };
+    },
+  });
+
+  const result = await tool.execute({
+    baseStateVersion: state.stateVersion,
+    patch: {},
+    investigatedFields: ['inputs'],
+  }, { agent: { id: 'session-root', session: { header: {} } } });
+
+  assert.deepEqual(result.guidance.investigatedFields, ['inputs']);
+  assert.equal(result.guidance.next.kind, 'ask_field');
+  assert.equal(result.guidance.next.field, 'inputs');
+  assert.equal(result.guidance.next.audience, 'member');
+  assert.match(result.guidance.next.prompt, /业务材料或信息/u);
+  assert.doesNotMatch(result.guidance.next.prompt, /请.*文件位置/u);
 });
 
 test('project reads, refreshes and work-description updates share one authoritative guidance snapshot', async () => {
@@ -153,18 +231,22 @@ test('project reads, refreshes and work-description updates share one authoritat
   });
   const tool = createWorkBriefTool({
     async contextForAgent() { return { workspaceId: 'workspace-1', state }; },
-    async updateProjectForAgent() { assert.fail('unchanged understanding must not write state'); },
+    async updateProjectForAgent(_agent, baseVersion, patch) {
+      assert.equal(baseVersion, state.stateVersion);
+      state = updateProjectState(state, patch);
+      return { workspaceId: 'workspace-1', state };
+    },
   });
 
   const read = createProjectResponse(state);
-  const refresh = createProjectResponse(structuredClone(state));
   const update = await tool.execute({ baseStateVersion: state.stateVersion, patch: { goal: '生成客户周报' } }, {
     agent: { id: 'session-root', session: { header: {} } },
   });
+  const refresh = createProjectResponse(structuredClone(state));
 
   assert.deepEqual(read.guidance, read.projection.guidance);
-  assert.deepEqual(refresh.guidance, read.guidance);
-  assert.deepEqual(update.guidance, read.guidance);
+  assert.deepEqual(update.guidance, refresh.guidance);
+  assert.deepEqual(refresh.guidance.changes, { confirmed: [], inferred: [], unresolved: [] });
   assert.deepEqual(Object.keys(read.guidance), [
     'schemaVersion',
     'stateVersion',
@@ -174,11 +256,13 @@ test('project reads, refreshes and work-description updates share one authoritat
     'progress',
     'unresolvedFields',
     'deferredFields',
+    'investigatedFields',
+    'changes',
     'next',
   ]);
 });
 
-test('work-description prompt exposes one deterministic next question and response discipline', () => {
+test('work-description prompt exposes one deterministic read-only investigation action and response discipline', () => {
   let state = createInitialState('客户周报');
   state = updateProjectState(state, {
     answers: { goal: '把每周客户沟通记录整理成周报' },
@@ -187,11 +271,12 @@ test('work-description prompt exposes one deterministic next question and respon
 
   const prompt = renderPromptWorkDescription(state, deriveProjectState(state), false);
 
-  assert.match(prompt, /唯一下一步：ask_field/u);
+  assert.match(prompt, /唯一下一步：inspect_context/u);
   assert.match(prompt, /对应字段：输入与资料来源/u);
-  assert.match(prompt, /请上传或指出一份最近实际使用过的材料/u);
+  assert.match(prompt, /只读检查后更新工作说明/u);
+  assert.match(prompt, /执行对象：万象/u);
   assert.match(prompt, /先更新工作说明，再用 1–2 句复述当前理解/u);
-  assert.match(prompt, /只能询问上面的唯一问题/u);
+  assert.match(prompt, /只有 ask_field 可以向用户提问/u);
 });
 
 test('making policy requires one automatic full Eval immediately after every Workflow change', () => {
@@ -384,6 +469,34 @@ test('monotonic discovery guard blocks manual permission bypasses', () => {
   buildAuthorized = true;
   assert.equal(guard(write), undefined);
   assert.equal(guard(proxyRun), undefined);
+});
+
+test('discovery question guard only allows the Host-selected single member question', async () => {
+  let state = createInitialState('客户周报');
+  const ctx = { workspaceRegistry: {} };
+  const context = { state };
+  const execution = (questions) => ({ name: 'ask_user_question', arguments: { questions } });
+
+  assert.equal(await discoveryToolAllowed(ctx, context, execution([
+    { question: '提前问输入？' },
+    { question: '再问输出？' },
+  ])), false);
+  assert.equal(await discoveryToolAllowed(ctx, context, execution([
+    { question: '提前问输入？' },
+  ])), false);
+  assert.equal(await discoveryToolAllowed(ctx, context, execution([
+    { question: deriveProjectState(state).guidance.next.prompt },
+  ])), true);
+
+  state = updateProjectState(state, {
+    answers: { goal: '每周生成客户周报' },
+    fieldSources: { goal: { status: 'user_confirmed', sourceMessageIds: [] } },
+  });
+  context.state = state;
+  assert.equal(deriveProjectState(state).guidance.next.kind, 'inspect_context');
+  assert.equal(await discoveryToolAllowed(ctx, context, execution([
+    { question: '现在请告诉我文件在哪里？' },
+  ])), false);
 });
 
 test('activation reserves the same idle root session then durably switches it to project-write', async () => {

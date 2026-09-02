@@ -29,7 +29,7 @@ test('v0.3 state contract survives understand-to-make in one canonical session',
       unresolvedOptional: ['examples', 'rules', 'boundaries'],
     },
     guidance: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       stateVersion: 1,
       briefRevision: 0,
       stage: 'understanding',
@@ -49,9 +49,12 @@ test('v0.3 state contract survives understand-to-make in one canonical session',
       },
       unresolvedFields: ANSWER_KEYS,
       deferredFields: ['examples', 'rules', 'boundaries'],
+      investigatedFields: [],
+      changes: { confirmed: [], inferred: [], unresolved: [] },
       next: {
         kind: 'ask_field',
         field: 'goal',
+        audience: 'member',
         prompt: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
       },
     },
@@ -194,13 +197,19 @@ function assertStateContract(state, expected) {
     'confirmedAnswers',
     'confirmedFieldSources',
     'confirmedRevision',
+    'deferredFields',
     'fieldSources',
+    'investigatedFields',
+    'lastChanges',
     'revision',
   ]);
   assert.deepEqual(Object.keys(state.brief.answers), ANSWER_KEYS);
   assert.deepEqual(Object.keys(state.brief.fieldSources), ANSWER_KEYS);
   assert.equal(state.brief.revision, expected.briefRevision);
   assert.equal(state.brief.confirmedRevision, expected.confirmedRevision);
+  assert.ok(Array.isArray(state.brief.deferredFields));
+  assert.ok(Array.isArray(state.brief.investigatedFields));
+  assert.deepEqual(Object.keys(state.brief.lastChanges).sort(), ['confirmed', 'inferred', 'unresolved']);
   assert.deepEqual(Object.keys(state.work).sort(), ['activation', 'activeRevision', 'sessionId']);
 }
 

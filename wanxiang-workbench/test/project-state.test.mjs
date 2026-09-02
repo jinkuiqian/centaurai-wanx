@@ -78,7 +78,7 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
       unresolvedOptional: ['examples', 'rules', 'boundaries'],
     },
     guidance: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       stateVersion: 1,
       briefRevision: 0,
       stage: 'understanding',
@@ -106,16 +106,19 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
       },
       unresolvedFields: ['goal', 'inputs', 'examples', 'rules', 'output', 'boundaries', 'success'],
       deferredFields: ['examples', 'rules', 'boundaries'],
+      investigatedFields: [],
+      changes: { confirmed: [], inferred: [], unresolved: [] },
       next: {
         kind: 'ask_field',
         field: 'goal',
+        audience: 'member',
         prompt: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
       },
     },
   });
 });
 
-test('guidance snapshot owns the current understanding, unresolved fields and one next action', () => {
+test('guidance snapshot owns the current understanding, latest changes and one next action', () => {
   let state = createInitialState('客户周报');
   state = updateProjectState(state, {
     answers: { goal: '把每周客户沟通记录整理成周报' },
@@ -124,7 +127,7 @@ test('guidance snapshot owns the current understanding, unresolved fields and on
 
   const snapshot = deriveGuidance(state);
 
-  assert.equal(snapshot.schemaVersion, 1);
+  assert.equal(snapshot.schemaVersion, 2);
   assert.equal(snapshot.stateVersion, state.stateVersion);
   assert.equal(snapshot.briefRevision, state.brief.revision);
   assert.deepEqual(snapshot.understanding, {
@@ -141,47 +144,115 @@ test('guidance snapshot owns the current understanding, unresolved fields and on
     allKnown: 1,
     allTotal: 7,
   });
+  assert.deepEqual(snapshot.changes, { confirmed: [], inferred: ['goal'], unresolved: [] });
   assert.deepEqual(snapshot.next, {
-    kind: 'ask_field',
+    kind: 'inspect_context',
     field: 'inputs',
-    prompt: '请上传或指出一份最近实际使用过的材料；如果不方便上传，请说明它的类型和关键内容。',
+    audience: 'agent',
+    prompt: '请先在当前项目和用户已选择的材料中查找实际输入的类型、位置和结构；只读检查后更新工作说明，不要把这些可查事实转问用户。',
+  });
+
+  const consumed = updateProjectState(state, { consumeGuidanceChanges: true });
+  assert.equal(consumed.stateVersion, state.stateVersion + 1);
+  assert.equal(consumed.brief.revision, state.brief.revision);
+  assert.deepEqual(deriveGuidance(consumed).changes, {
+    confirmed: [], inferred: [], unresolved: [],
   });
 });
 
-test('guidance advances through one fixed required-field question and then requests one review', () => {
+test('guidance follows field dependencies and recomputes the most critical eligible action', () => {
   let state = createInitialState('客户周报');
-  const expectedOrder = ['goal', 'inputs', 'output', 'success'];
+  state = updateProjectState(state, {
+    answers: { success: '周报包含所有逾期客户', goal: '每周生成客户周报' },
+    fieldSources: {
+      success: { status: 'user_confirmed', sourceMessageIds: ['message-1'] },
+      goal: { status: 'user_confirmed', sourceMessageIds: ['message-1'] },
+    },
+  });
 
-  for (const key of expectedOrder) {
-    assert.equal(deriveGuidance(state).next.field, key);
-    state = updateProjectState(state, {
-      answers: { [key]: `${key} answer` },
-      fieldSources: { [key]: { status: 'inferred', sourceMessageIds: [`message-${key}`] } },
-    });
-  }
+  assert.deepEqual(deriveGuidance(state).next, {
+    kind: 'inspect_context',
+    field: 'inputs',
+    audience: 'agent',
+    prompt: '请先在当前项目和用户已选择的材料中查找实际输入的类型、位置和结构；只读检查后更新工作说明，不要把这些可查事实转问用户。',
+  });
+  state = updateProjectState(state, { investigatedFields: ['inputs'] });
+  assert.deepEqual(deriveGuidance(state).changes, { confirmed: [], inferred: [], unresolved: [] });
+  assert.equal(deriveGuidance(state).next.field, 'inputs');
+  assert.equal(deriveGuidance(state).next.kind, 'ask_field');
+  state = updateProjectState(state, {
+    answers: { inputs: 'CRM 导出的客户表' },
+    fieldSources: { inputs: { status: 'user_confirmed', sourceMessageIds: ['message-2'] } },
+  });
+  assert.equal(deriveGuidance(state).next.field, 'output');
+  state = updateProjectState(state, {
+    answers: { output: '给销售主管的 Markdown 周报' },
+    fieldSources: { output: { status: 'inferred', sourceMessageIds: ['message-3'] } },
+  });
 
   const review = deriveGuidance(state);
   assert.equal(review.stage, 'reviewing');
   assert.equal(review.next.kind, 'review_and_confirm');
   assert.deepEqual(review.progress, {
     requiredKnown: 4,
-    requiredConfirmed: 0,
+    requiredConfirmed: 3,
     requiredTotal: 4,
     allKnown: 4,
     allTotal: 7,
   });
   assert.deepEqual(review.deferredFields, ['examples', 'rules', 'boundaries']);
 
-  state = updateProjectState(state, {
-    fieldSources: Object.fromEntries(expectedOrder.map((key) => [key, {
-      status: 'user_confirmed',
-      sourceMessageIds: state.brief.fieldSources[key].sourceMessageIds,
-    }])),
+  assert.equal(review.next.audience, null);
+});
+
+test('changing an upstream goal invalidates prior input investigation', () => {
+  let state = updateProjectState(createInitialState('客户周报'), {
+    answers: { goal: '每周生成客户周报', inputs: 'crm/customer-notes.csv' },
+    fieldSources: {
+      goal: { status: 'user_confirmed', sourceMessageIds: ['message-1'] },
+      inputs: { status: 'inferred', sourceMessageIds: [] },
+    },
+    investigatedFields: ['inputs'],
   });
-  const ready = deriveGuidance(state);
-  assert.equal(ready.stage, 'ready');
-  assert.equal(ready.next.kind, 'start_making');
-  assert.equal(ready.progress.requiredConfirmed, 4);
+  assert.equal(deriveGuidance(state).next.kind, 'ask_field');
+
+  state = updateProjectState(state, {
+    answers: { goal: '每天生成客户风险清单' },
+    fieldSources: { goal: { status: 'user_confirmed', sourceMessageIds: ['message-2'] } },
+  });
+
+  assert.deepEqual(state.brief.investigatedFields, []);
+  assert.equal(state.brief.answers.inputs, '');
+  assert.equal(state.brief.fieldSources.inputs.status, 'unresolved');
+  assert.equal(deriveGuidance(state).next.kind, 'inspect_context');
+  assert.equal(deriveGuidance(state).next.field, 'inputs');
+});
+
+test('explicit unknown answers remain unresolved and do not repeat or unblock dependent questions', () => {
+  let state = createInitialState('客户周报');
+  state = updateProjectState(state, {
+    answers: { goal: '每周生成客户周报' },
+    fieldSources: { goal: { status: 'user_confirmed', sourceMessageIds: ['message-1'] } },
+    investigatedFields: ['inputs'],
+  });
+  state = updateProjectState(state, { deferredFields: ['inputs'] });
+
+  const afterUnknown = deriveGuidance(state);
+  assert.equal(afterUnknown.next.kind, 'ask_field');
+  assert.equal(afterUnknown.next.field, 'output');
+  assert.deepEqual(afterUnknown.changes, { confirmed: [], inferred: [], unresolved: ['inputs'] });
+  assert.equal(afterUnknown.progress.requiredKnown, 1);
+
+  state = updateProjectState(state, {
+    answers: { output: 'Markdown 周报' },
+    fieldSources: { output: { status: 'user_confirmed', sourceMessageIds: ['message-2'] } },
+  });
+  const blocked = deriveGuidance(state);
+  assert.equal(blocked.next.kind, 'await_required');
+  assert.equal(blocked.next.field, 'inputs');
+  assert.equal(blocked.next.audience, null);
+  assert.equal(blocked.unresolvedFields.includes('inputs'), true);
+  assert.equal(blocked.progress.requiredKnown, 2);
 });
 
 test('guidance treats optional fields as non-blocking and covers the activation lifecycle', () => {
@@ -363,7 +434,10 @@ test('work-brief.md is generated atomically only by confirm', async (t) => {
 
 test('confirmed brief renders unresolved optional fields as production-time validation', () => {
   const state = createInitialState('可验证项目', '2026-01-01T00:00:00.000Z');
-  for (const key of REQUIRED_BRIEF_FIELDS) state.brief.answers[key] = `${key} answer`;
+  for (const key of REQUIRED_BRIEF_FIELDS) {
+    state.brief.answers[key] = `${key} answer`;
+    state.brief.fieldSources[key] = { status: 'user_confirmed', sourceMessageIds: [] };
+  }
   state.brief.revision = 1;
   const confirmed = confirmProjectState(state, 1);
 
@@ -487,6 +561,9 @@ test('first activation failure rolls confirmation back to an unconfirmed draft',
 test('failed activation is retry-safe and derived as a recoverable failure', () => {
   const state = createInitialState('项目', '2026-01-01T00:00:00.000Z');
   state.brief.answers = completeAnswers();
+  state.brief.fieldSources = Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, {
+    status: 'user_confirmed', sourceMessageIds: [],
+  }]));
   state.brief.revision = 1;
   const confirmed = confirmProjectState(state, 1);
   const reserved = reserveActivation(confirmed, {
@@ -540,6 +617,9 @@ test('confirmed canonical state repairs a pending derived brief after restart', 
   await mkdir(artifactRoot);
   const state = createInitialState('可恢复项目', '2026-01-01T00:00:00.000Z');
   state.brief.answers = completeAnswers();
+  state.brief.fieldSources = Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, {
+    status: 'user_confirmed', sourceMessageIds: [],
+  }]));
   state.brief.revision = 1;
   const confirmed = confirmProjectState(state, 1);
   await writeFile(path.join(artifactRoot, 'project.json'), `${JSON.stringify(confirmed)}\n`);
