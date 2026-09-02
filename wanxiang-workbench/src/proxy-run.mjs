@@ -259,14 +259,14 @@ export function createProxyRunToolAdapter({
         startedAt,
       };
       await projectService.startEvaluationRun(String(context.workspaceId), runStart);
-      agent.session.append('tool-workflow/run-start', {
-        ...runStart,
-        name: PROXY_RUN_WORKFLOW_NAME,
-        projectId: context.workspaceId,
-      });
-      await flushSession(agent.session);
 
       try {
+        agent.session.append('tool-workflow/run-start', {
+          ...runStart,
+          name: PROXY_RUN_WORKFLOW_NAME,
+          projectId: context.workspaceId,
+        });
+        await flushSession(agent.session);
         const actual = await runner.run({
           workspacePath: context.workspacePath,
           entrypoint: evaluation.workflow.entrypoint,

@@ -318,6 +318,66 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   });
 });
 
+test('DSH start fact persistence failure finalizes the protected project run with failure evidence', async () => {
+  const caseId = 'normal-case-v2';
+  const events = [];
+  const projectRuns = [];
+  const saved = [];
+  let flushes = 0;
+  let runnerCalls = 0;
+  const session = { header: {}, append(type, data) { events.push({ type, data: structuredClone(data) }); } };
+  const agent = { id: 'session-1', session };
+  const tool = createProxyRunToolAdapter({
+    projectService: {
+      async contextForAgent() {
+        return {
+          workspaceId: 'project-1', workspacePath: '/managed/project',
+          state: { brief: { revision: 7 }, work: { sessionId: 'session-1', activeRevision: 7 } },
+        };
+      },
+      async startEvaluationRun(projectId, value) {
+        projectRuns.push({ phase: 'start', projectId, value: structuredClone(value) });
+      },
+      async finishEvaluationRun(projectId, value) {
+        projectRuns.push({ phase: 'finish', projectId, value: structuredClone(value) });
+      },
+    },
+    evaluationStore: {
+      async load() {
+        return {
+          workflow: { workflowVersion: '2.0.0', entrypoint: 'workflow.mjs' }, source: 'source',
+          eval: { revision: 3, cases: [{ id: caseId, input: {}, expected: {} }] },
+        };
+      },
+    },
+    runner: { async run() { runnerCalls += 1; } },
+    workflowEngine: { start() { assert.fail('failed start fact must not reach assertions'); } },
+    evidenceStore: { async save(value) { saved.push(structuredClone(value)); } },
+    flushSession: async () => {
+      flushes += 1;
+      if (flushes === 1) throw Object.assign(new Error('DSH fact flush failed'), { code: 'session_flush_failed' });
+    },
+    createRunId: () => 'run-start-failed-1',
+    now: sequenceClock('2026-09-02T10:00:00.000Z', '2026-09-02T10:00:01.000Z'),
+  });
+
+  await assert.rejects(
+    tool.execute({ caseId }, { agent, signal: new AbortController().signal }),
+    (error) => error.code === 'session_flush_failed' && error.evaluationRecorded === true,
+  );
+
+  assert.equal(runnerCalls, 0);
+  assert.equal(flushes, 2);
+  assert.deepEqual(events.map((event) => event.type), ['tool-workflow/run-start', 'tool-workflow/run-end']);
+  assert.equal(saved[0].runId, 'run-start-failed-1');
+  assert.equal(saved[0].status, 'failed');
+  assert.equal(saved[0].error.code, 'session_flush_failed');
+  assert.deepEqual(projectRuns.map(({ phase, value }) => [phase, value.runId, value.status]), [
+    ['start', 'run-start-failed-1', undefined],
+    ['finish', 'run-start-failed-1', 'failed'],
+  ]);
+});
+
 test('runner failures become structured evidence and a terminal fact in the same DSH session', async () => {
   const currentCaseId = 'normal-case-v2';
   const events = [];

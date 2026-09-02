@@ -72,7 +72,7 @@ function initialEvaluationRuns() {
 
 function startEvaluationRunState(current, input) {
   if (!isEvaluationRunStart(input)) {
-    throw serviceError(400, 'evaluation_run_invalid', '代理运行记录无效。');
+    throw serviceError(400, 'evaluation_run_invalid', '代理运行证据无效。');
   }
   if (current.runs.byId[input.runId]) {
     throw serviceError(409, 'evaluation_run_id_conflict', '这个代理运行 ID 已经存在，不能复用。');
