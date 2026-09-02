@@ -58,6 +58,7 @@ test('v0.3 state contract survives understand-to-make in one canonical session',
         prompt: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
       },
     },
+    maturity: { stage: 'understanding', acceptedRealRunCount: 0 },
   });
 
   for (const [index, key] of ANSWER_KEYS.entries()) {
@@ -179,6 +180,7 @@ function assertStateContract(state, expected) {
   assert.deepEqual(Object.keys(state).sort(), [
     'brief',
     'createdAt',
+    'feedback',
     'projectName',
     'runs',
     'schemaVersion',
@@ -192,6 +194,7 @@ function assertStateContract(state, expected) {
   assert.equal(typeof state.createdAt, 'string');
   assert.equal(typeof state.updatedAt, 'string');
   assert.deepEqual(state.runs, { latestRunId: null, order: [], byId: {} });
+  assert.deepEqual(state.feedback, { order: [], byId: {} });
   assert.deepEqual(Object.keys(state.brief).sort(), [
     'answers',
     'confirmedAnswers',

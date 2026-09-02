@@ -73,6 +73,7 @@ export function createInitialState(projectName, timestamp = new Date().toISOStri
     },
     work: { sessionId: null, activeRevision: null, activation: null },
     runs: initialEvaluationRuns(),
+    feedback: initialRunFeedback(),
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -82,12 +83,16 @@ function initialEvaluationRuns() {
   return { latestRunId: null, order: [], byId: {} };
 }
 
-function startEvaluationRunState(current, input, runtimeId) {
-  if (!isEvaluationRunStart(input)) {
-    throw serviceError(400, 'evaluation_run_invalid', '代理运行证据无效。');
+function initialRunFeedback() {
+  return { order: [], byId: {} };
+}
+
+function startRunState(current, input, runtimeId) {
+  if (!isRunStart(input)) {
+    throw serviceError(400, 'run_invalid', '运行证据无效。');
   }
   if (current.runs.byId[input.runId]) {
-    throw serviceError(409, 'evaluation_run_id_conflict', '这个代理运行 ID 已经存在，不能复用。');
+    throw serviceError(409, 'evaluation_run_id_conflict', '这个运行 ID 已经存在，不能复用。');
   }
   if (input.retryOf !== null) {
     const previous = current.runs.byId[input.retryOf];
@@ -115,16 +120,16 @@ function startEvaluationRunState(current, input, runtimeId) {
   };
 }
 
-function finishEvaluationRunState(current, input) {
-  if (!isEvaluationRunFinish(input)) {
-    throw serviceError(400, 'evaluation_run_invalid', '代理运行结论无效。');
+function finishRunState(current, input) {
+  if (!isRunFinish(input)) {
+    throw serviceError(400, 'run_invalid', '运行结论无效。');
   }
   const run = current.runs.byId[input.runId];
-  if (!run) throw serviceError(404, 'evaluation_run_not_found', '找不到这次代理运行。');
+  if (!run) throw serviceError(404, 'evaluation_run_not_found', '找不到这次运行。');
   const completed = { ...run, ...structuredClone(input) };
   if (run.status !== 'running') {
     if (JSON.stringify(run) === JSON.stringify(completed)) return current;
-    throw serviceError(409, 'evaluation_run_already_finalized', '这次代理运行已经结束，不能改写结论。', { current: run });
+    throw serviceError(409, 'evaluation_run_already_finalized', '这次运行已经结束，不能改写结论。', { current: run });
   }
   return {
     ...current,
@@ -134,6 +139,43 @@ function finishEvaluationRunState(current, input) {
       byId: { ...current.runs.byId, [run.runId]: completed },
     },
     updatedAt: input.completedAt,
+  };
+}
+
+function recordRunFeedbackState(current, workspaceId, input, sessionId, timestamp, id) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)
+    || typeof input.runId !== 'string' || !input.runId
+    || !['correct', 'needs_changes', 'unacceptable'].includes(input.verdict)
+    || typeof input.note !== 'string' || input.note.length > 12_000
+    || Object.keys(input).some((key) => !['runId', 'verdict', 'note'].includes(key))) {
+    throw serviceError(400, 'run_feedback_invalid', '请选择反馈结论，并填写有效的补充说明。');
+  }
+  const run = current.runs.byId[input.runId];
+  if (!run || run.kind !== 'real' || run.status === 'running') {
+    throw serviceError(409, 'run_feedback_unavailable', '只能评价已经结束的影子运行。');
+  }
+  if (run.sessionId !== sessionId) {
+    throw serviceError(403, 'run_feedback_session_mismatch', '只能在运行这个案例的当前制作会话中提交反馈。');
+  }
+  const feedback = {
+    id,
+    workspaceId,
+    runId: run.runId,
+    caseId: run.caseId,
+    verdict: input.verdict,
+    note: input.note.trim(),
+    workBriefRevision: run.workBriefRevision,
+    agentVersion: run.agentVersion,
+    createdAt: timestamp,
+  };
+  return {
+    ...current,
+    stateVersion: current.stateVersion + 1,
+    feedback: {
+      order: [...current.feedback.order, feedback.id],
+      byId: { ...current.feedback.byId, [feedback.id]: feedback },
+    },
+    updatedAt: timestamp,
   };
 }
 
@@ -381,7 +423,16 @@ export function deriveProjectState(state) {
   else if (state.work.activeRevision !== null && state.brief.revision > state.work.activeRevision) phase = 'changed';
   else if (activation?.status === 'active' && state.work.activeRevision === state.brief.revision) phase = 'making';
   else if (readiness.ready) phase = 'ready';
-  return { phase, readiness, guidance };
+  const acceptedRealRuns = new Set(state.feedback.order
+    .map((feedbackId) => state.feedback.byId[feedbackId])
+    .filter((feedback) => feedback.verdict === 'correct'
+      && state.runs.byId[feedback.runId]?.status === 'passed')
+    .map((feedback) => feedback.runId));
+  const maturity = {
+    stage: acceptedRealRuns.size > 0 ? 'can_try' : phase === 'making' ? 'making' : phase,
+    acceptedRealRunCount: acceptedRealRuns.size,
+  };
+  return { phase, readiness, guidance, maturity };
 }
 
 export function reserveActivation(current, request, timestamp = new Date().toISOString(), id = randomUUID()) {
@@ -660,18 +711,45 @@ export class WanxiangStateService {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
       const current = await this.#loadState(workspace);
-      const next = startEvaluationRunState(current, input, this.runtimeId);
+      const next = startRunState(current, input, this.runtimeId);
       await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
     });
   }
 
-  async finishEvaluationRun(workspaceId, input) {
+  async startRealWorkRun(workspaceId, input) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
       const current = await this.#loadState(workspace);
-      const next = finishEvaluationRunState(current, input);
+      const next = startRunState(current, { ...input, kind: 'real' }, this.runtimeId);
+      await writeProjectState(workspace, next, this.dataRoot, this.id);
+      return next;
+    });
+  }
+
+  async finishRun(workspaceId, input) {
+    const workspace = await this.resolveWorkspace(workspaceId);
+    return withSerialLock(workspaceLocks, String(workspace.id), async () => {
+      const current = await this.#loadState(workspace);
+      const next = finishRunState(current, input);
       if (next !== current) await writeProjectState(workspace, next, this.dataRoot, this.id);
+      return next;
+    });
+  }
+
+  async finishEvaluationRun(workspaceId, input) {
+    return this.finishRun(workspaceId, input);
+  }
+
+  async recordRunFeedback(workspaceId, baseVersion, input, sessionId) {
+    const workspace = await this.resolveWorkspace(workspaceId);
+    return withSerialLock(workspaceLocks, String(workspace.id), async () => {
+      const current = await this.#loadState(workspace);
+      assertBaseVersion(current, baseVersion);
+      const next = recordRunFeedbackState(
+        current, String(workspace.id), input, sessionId, this.now(), this.id(),
+      );
+      await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
     });
   }
@@ -1222,7 +1300,7 @@ async function loadOrMigrate(workspace, timestamp, id, dataRoot, runtimeId) {
   if (canonical) {
     const stored = await readStoredState(canonical, recoverConfirmedAnswers);
     if (stored) {
-      const state = recoverInterruptedEvaluationRuns(stored.state, runtimeId, timestamp);
+      const state = recoverInterruptedRuns(stored.state, runtimeId, timestamp);
       if (stored.migrated || state !== stored.state) await writeCanonicalProjectFile(canonical, state, id);
       await syncProjectMirror(mirror, state, id).catch(() => {});
       await reconcileBriefArtifact(workspace.path, state, id);
@@ -1242,7 +1320,7 @@ async function loadOrMigrate(workspace, timestamp, id, dataRoot, runtimeId) {
       state = createInitialState(workspace.title, timestamp);
     }
   }
-  state = recoverInterruptedEvaluationRuns(state, runtimeId, timestamp);
+  state = recoverInterruptedRuns(state, runtimeId, timestamp);
   if (canonical) await writeCanonicalProjectFile(canonical, state, id);
   if (canonical) await syncProjectMirror(mirror, state, id).catch(() => {});
   else await syncProjectMirror(mirror, state, id);
@@ -1250,7 +1328,7 @@ async function loadOrMigrate(workspace, timestamp, id, dataRoot, runtimeId) {
   return state;
 }
 
-function recoverInterruptedEvaluationRuns(state, runtimeId, timestamp) {
+function recoverInterruptedRuns(state, runtimeId, timestamp) {
   const interruptedIds = state.runs.order.filter((runId) => {
     const run = state.runs.byId[runId];
     return run.status === 'running' && run.runtimeInstanceId !== runtimeId;
@@ -1258,15 +1336,20 @@ function recoverInterruptedEvaluationRuns(state, runtimeId, timestamp) {
   if (!interruptedIds.length) return state;
   const byId = { ...state.runs.byId };
   for (const runId of interruptedIds) {
+    const isShadowRun = byId[runId].kind === 'real';
     byId[runId] = {
       ...byId[runId],
       status: 'failed',
       conclusion: 'interrupted',
       completedAt: timestamp,
       evidence: {
-        summary: '运行时重启前未能确认这次代理运行的结论。',
+        ...(byId[runId].input ? { input: structuredClone(byId[runId].input) } : {}),
+        summary: `运行时重启前未能确认这次${isShadowRun ? '影子运行' : '代理运行'}的结论。`,
         assertions: [],
-        error: { code: 'runtime_restarted', message: '运行时重启，未完成的代理运行已按未通过恢复。' },
+        error: {
+          code: 'runtime_restarted',
+          message: `运行时重启，未完成的${isShadowRun ? '影子运行' : '代理运行'}已按未通过恢复。`,
+        },
       },
     };
   }
@@ -1409,14 +1492,14 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
     if (Object.hasOwn(state.brief || {}, 'confirmedAnswers')
       && Object.hasOwn(state.brief || {}, 'confirmedFieldSources')) {
       return validateV2State(releaseFailedActivationSession(withGuidanceMetadata(
-        Object.hasOwn(state, 'runs') ? state : { ...state, runs: initialEvaluationRuns() },
+        withRunFeedback(Object.hasOwn(state, 'runs') ? state : { ...state, runs: initialEvaluationRuns() }),
       )));
     }
     const confirmedAnswers = state.brief?.confirmedRevision === null
       ? null
       : (state.brief.confirmedRevision === state.brief.revision ? state.brief.answers : recoveredAnswers);
     const confirmedFieldSources = confirmedAnswers ? cloneFieldSources(state.brief.fieldSources) : null;
-    return validateV2State(releaseFailedActivationSession(withGuidanceMetadata({
+    return validateV2State(releaseFailedActivationSession(withGuidanceMetadata(withRunFeedback({
       ...state,
       brief: {
         ...state.brief,
@@ -1424,7 +1507,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
         confirmedAnswers: confirmedAnswers ? { ...confirmedAnswers } : null,
         confirmedFieldSources,
       },
-    })));
+    }))));
   }
   validateV1State(state);
   const answers = Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, key === 'examples' ? '' : state.brief.answers[key]]));
@@ -1480,9 +1563,14 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
       activation,
     },
     runs: initialEvaluationRuns(),
+    feedback: initialRunFeedback(),
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
   }));
+}
+
+function withRunFeedback(state) {
+  return Object.hasOwn(state, 'feedback') ? state : { ...state, feedback: initialRunFeedback() };
 }
 
 function withGuidanceMetadata(state) {
@@ -1542,7 +1630,7 @@ function validateV1State(state) {
 function validateV2State(state) {
   if (!state || state.schemaVersion !== 2 || !Number.isInteger(state.stateVersion) || state.stateVersion < 1
     || typeof state.projectName !== 'string' || !state.projectName.trim() || !state.brief || !state.work
-    || !isEvaluationRuns(state.runs)
+    || !isRuns(state.runs) || !isRunFeedbackStore(state.feedback, state.runs)
     || !Number.isInteger(state.brief.revision) || state.brief.revision < 0
     || !isValidFieldKeyList(state.brief.deferredFields)
     || !isValidFieldKeyList(state.brief.investigatedFields)
@@ -1606,29 +1694,35 @@ function isValidFieldKeyList(value) {
   return fieldKeyListsEqual(value, ordered);
 }
 
-function isEvaluationRuns(value) {
+function isRuns(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || !(value.latestRunId === null || typeof value.latestRunId === 'string')
     || !Array.isArray(value.order) || !value.byId || typeof value.byId !== 'object' || Array.isArray(value.byId)
     || new Set(value.order).size !== value.order.length
-    || value.order.some((runId) => typeof runId !== 'string' || !isEvaluationRun(value.byId[runId]))
+    || value.order.some((runId) => typeof runId !== 'string' || !isRun(value.byId[runId]))
     || Object.keys(value.byId).length !== value.order.length
     || (value.latestRunId !== null && value.latestRunId !== value.order.at(-1))) return false;
   return Object.entries(value.byId).every(([runId, run]) => run.runId === runId
     && (run.retryOf === null || (value.byId[run.retryOf] && value.order.indexOf(run.retryOf) < value.order.indexOf(runId))));
 }
 
-function isEvaluationRunStart(value) {
+function isRunStart(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
-    && Object.keys(value).every((key) => ['runId', 'sessionId', 'caseId', 'agentVersion', 'workflowVersion', 'evalRevision', 'workBriefRevision', 'retryOf', 'startedAt'].includes(key))
+    && Object.keys(value).every((key) => ['runId', 'sessionId', 'caseId', 'caseTitle', 'kind', 'input', 'agentVersion', 'workflowVersion', 'evalRevision', 'workBriefRevision', 'retryOf', 'startedAt'].includes(key))
     && ['runId', 'sessionId', 'caseId', 'workflowVersion', 'startedAt'].every((key) => typeof value[key] === 'string' && value[key])
     && (value.agentVersion === undefined || (typeof value.agentVersion === 'string' && value.agentVersion))
+    && (value.kind === undefined || ['evaluation', 'real'].includes(value.kind))
+    && (value.caseTitle === undefined || (typeof value.caseTitle === 'string' && value.caseTitle))
+    && (value.input === undefined || (value.input && typeof value.input === 'object' && !Array.isArray(value.input)))
+    && (value.kind !== 'real' || (typeof value.agentVersion === 'string' && value.agentVersion
+      && typeof value.caseTitle === 'string' && value.caseTitle
+      && value.input && typeof value.input === 'object' && !Array.isArray(value.input)))
     && Number.isInteger(value.evalRevision) && value.evalRevision > 0
     && Number.isInteger(value.workBriefRevision) && value.workBriefRevision >= 0
     && (value.retryOf === null || (typeof value.retryOf === 'string' && value.retryOf));
 }
 
-function isEvaluationRunFinish(value) {
+function isRunFinish(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
     && Object.keys(value).every((key) => ['runId', 'status', 'conclusion', 'completedAt', 'evidence'].includes(key))
     && typeof value.runId === 'string' && value.runId
@@ -1640,11 +1734,14 @@ function isEvaluationRunFinish(value) {
     && value.evidence && typeof value.evidence === 'object' && !Array.isArray(value.evidence);
 }
 
-function isEvaluationRun(value) {
-  if (!value || !isEvaluationRunStart({
+function isRun(value) {
+  if (!value || !isRunStart({
     runId: value.runId,
     sessionId: value.sessionId,
     caseId: value.caseId,
+    ...(value.caseTitle ? { caseTitle: value.caseTitle } : {}),
+    ...(value.kind ? { kind: value.kind } : {}),
+    ...(value.input ? { input: value.input } : {}),
     ...(value.agentVersion ? { agentVersion: value.agentVersion } : {}),
     workflowVersion: value.workflowVersion,
     evalRevision: value.evalRevision,
@@ -1655,13 +1752,35 @@ function isEvaluationRun(value) {
   if (value.status === 'running') {
     return value.completedAt === null && value.conclusion === null && value.evidence === null;
   }
-  return isEvaluationRunFinish({
+  return isRunFinish({
     runId: value.runId,
     status: value.status,
     conclusion: value.conclusion,
     completedAt: value.completedAt,
     evidence: value.evidence,
   });
+}
+
+function isRunFeedbackStore(value, runs) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !Array.isArray(value.order) || !value.byId || typeof value.byId !== 'object' || Array.isArray(value.byId)
+    || new Set(value.order).size !== value.order.length
+    || value.order.some((feedbackId) => typeof feedbackId !== 'string' || !isRunFeedback(value.byId[feedbackId], runs))
+    || Object.keys(value.byId).length !== value.order.length) return false;
+  return Object.entries(value.byId).every(([feedbackId, feedback]) => feedback.id === feedbackId);
+}
+
+function isRunFeedback(value, runs) {
+  const run = runs.byId[value?.runId];
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).every((key) => ['id', 'workspaceId', 'runId', 'caseId', 'verdict', 'note', 'workBriefRevision', 'agentVersion', 'createdAt'].includes(key))
+    && ['id', 'workspaceId', 'runId', 'caseId', 'note', 'agentVersion', 'createdAt'].every((key) => typeof value[key] === 'string')
+    && value.id && value.workspaceId && value.runId && value.caseId && value.agentVersion && value.createdAt
+    && ['correct', 'needs_changes', 'unacceptable'].includes(value.verdict)
+    && Number.isInteger(value.workBriefRevision) && value.workBriefRevision >= 0
+    && run?.kind === 'real' && run.status !== 'running'
+    && value.caseId === run.caseId && value.workBriefRevision === run.workBriefRevision
+    && value.agentVersion === run.agentVersion;
 }
 
 function isStructuredDispatchError(value) {

@@ -163,6 +163,12 @@ window.__ModuleLoader__.load({
         byId: Object.fromEntries(order.map((runId) => [runId, rawById[runId]])),
       };
     }
+    function normalizeFeedback(value) {
+      const source = value && typeof value === "object" ? value : {};
+      const rawById = source.byId && typeof source.byId === "object" ? source.byId : {};
+      const order = Array.isArray(source.order) ? source.order.filter((feedbackId) => typeof feedbackId === "string" && rawById[feedbackId]) : [];
+      return { order, byId: Object.fromEntries(order.map((feedbackId) => [feedbackId, rawById[feedbackId]])) };
+    }
     function emptyProject(workspaceId) {
       const answers = Object.fromEntries(fields.map(({ key }) => [key, ""]));
       const fieldSources = Object.fromEntries(fields.map(({ key }) => [key, { status: "unresolved", sourceMessageIds: [] }]));
@@ -180,6 +186,8 @@ window.__ModuleLoader__.load({
         work: { sessionId: null, activeRevision: null, activation: null },
         evaluation: normalizeEvaluation(null),
         runs: normalizeRuns(null),
+        feedback: normalizeFeedback(null),
+        maturity: { stage: "understanding", acceptedRealRunCount: 0 },
       };
       return { ...project, ...deriveProjection(project) };
     }
@@ -232,6 +240,7 @@ window.__ModuleLoader__.load({
         },
         evaluation: normalizeEvaluation(value?.evaluation || source.evaluation || records.get(workspaceId)?.project?.evaluation),
         runs: normalizeRuns(source.runs),
+        feedback: normalizeFeedback(source.feedback),
       };
       const derived = authoritativeGuidance ? null : deriveProjection(project);
       const hostPhase = ["understanding", "ready", "making", "changed", "failed"].includes(projection?.phase)
@@ -248,6 +257,8 @@ window.__ModuleLoader__.load({
         phase: hostPhase || derived?.phase || "understanding",
         readiness: hostReadiness || derived?.readiness || { ready: false, missingRequired: [], unresolvedOptional: [] },
         guidance: authoritativeGuidance || derived.guidance,
+        maturity: projection?.maturity && typeof projection.maturity.stage === "string"
+          ? projection.maturity : { stage: hostPhase || derived?.phase || "understanding", acceptedRealRunCount: 0 },
       };
     }
     function readDraft(workspaceId) {
@@ -402,6 +413,46 @@ window.__ModuleLoader__.load({
         replaceRecord(workspaceId, {
           status: prior.status, busy: false, error: error.message, errorCode: error.code,
         });
+      }
+    }
+
+    async function runRealWork(workspaceId, sessionId, caseTitle, input) {
+      const prior = recordFor(workspaceId);
+      replaceRecord(workspaceId, { busy: true, error: "", errorCode: "" });
+      try {
+        const body = await apiJson("/api/wanxiang/work-run", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workspaceId, sessionId, caseTitle, input }),
+        });
+        assertGeneration();
+        replaceRecord(workspaceId, {
+          status: "ready", busy: false, project: normalizeProject(body, workspaceId), error: "", errorCode: "", conflict: false,
+        });
+        broadcast(workspaceId);
+      } catch (error) {
+        await loadProject(workspaceId, true);
+        replaceRecord(workspaceId, { status: prior.status, busy: false, error: error.message, errorCode: error.code });
+        throw error;
+      }
+    }
+
+    async function submitRunFeedback(workspaceId, sessionId, runId, verdict, note) {
+      const record = recordFor(workspaceId);
+      replaceRecord(workspaceId, { busy: true, error: "", errorCode: "" });
+      try {
+        const body = await apiJson("/api/wanxiang/run-feedback", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workspaceId, sessionId, baseVersion: record.project.baseVersion, runId, verdict, note }),
+        });
+        assertGeneration();
+        replaceRecord(workspaceId, {
+          status: "ready", busy: false, project: normalizeProject(body, workspaceId), error: "", errorCode: "", conflict: false,
+        });
+        broadcast(workspaceId);
+      } catch (error) {
+        if (error.status === 409) await loadProject(workspaceId, true);
+        replaceRecord(workspaceId, { busy: false, error: error.message, errorCode: error.code });
+        throw error;
       }
     }
 
@@ -644,6 +695,7 @@ window.__ModuleLoader__.load({
       if (record.project.work.activation?.status === "pending") return "正在准备制作";
       if (record.project.phase === "failed") return "恢复制作";
       if (record.project.phase === "changed") return "确认修改并继续";
+      if (record.project.maturity?.stage === "can_try") return "可以试用";
       if (record.project.phase === "making") return `制作中 · v${record.project.work.activeRevision}`;
       if (record.project.phase === "ready") return record.project.guidance?.next?.kind === "review_and_confirm" ? "查看并确认工作说明" : "开始制作";
       const known = fields.filter((field) => !isPlaceholderAnswer(record.project.answers[field.key])).length;
@@ -727,9 +779,73 @@ window.__ModuleLoader__.load({
       };
       return labels[guidance?.next?.kind] || "继续补充工作说明";
     }
+    function RealRunCard({ run, feedback, onFeedback, busy }) {
+      const [note, setNote] = React.useState("");
+      const [error, setError] = React.useState("");
+      const executionSteps = Array.isArray(run.evidence?.steps) ? run.evidence.steps : [];
+      const taskSteps = Array.isArray(run.evidence?.taskSteps) ? run.evidence.taskSteps : [];
+      const keySteps = taskSteps.length ? taskSteps : executionSteps;
+      const submit = async (verdict) => {
+        setError("");
+        try { await onFeedback(run.runId, verdict, note.trim()); setNote(""); }
+        catch (cause) { setError(cause?.message || "反馈未能保存。"); }
+      };
+      return h("article", { className: "wx-real-result", "data-status": run.status },
+        h("header", null, h("strong", null, run.caseTitle || run.evidence?.caseTitle || "真实案例"), h("span", null, run.status === "passed" ? "已完成" : run.status === "running" ? "运行中" : "未完成")),
+        h("small", null, `工作说明 v${run.workBriefRevision} · Agent v${run.agentVersion} · runId ${run.runId}`),
+        run.evidence?.input ? h("details", null, h("summary", null, "真实工作输入"), h("pre", null, JSON.stringify(run.evidence.input, null, 2))) : null,
+        run.evidence?.output ? h("details", { open: true }, h("summary", null, "工作结果"), h("pre", null, JSON.stringify(run.evidence.output, null, 2))) : null,
+        keySteps.length ? h("details", null, h("summary", null, "关键步骤"), h("ol", null, keySteps.map((step) => h("li", { key: step.id }, h("span", null, step.label), step.status ? h("b", null, step.status === "completed" ? "完成" : step.status === "failed" ? "失败" : "跳过") : null)))) : null,
+        executionSteps.length ? h("details", null, h("summary", null, "运行事实"), h("ol", null, executionSteps.map((step) => h("li", { key: step.id }, h("span", null, step.label), step.facts ? h("pre", null, JSON.stringify(step.facts, null, 2)) : null)))) : null,
+        run.evidence?.error?.message ? h("p", { role: "alert" }, run.evidence.error.message) : null,
+        feedback.length ? h("ul", { className: "wx-member-feedback", "aria-label": "成员反馈历史" }, feedback.map((item) => h("li", { key: item.id },
+          h("b", null, { correct: "正确", needs_changes: "需要修改", unacceptable: "不可接受" }[item.verdict]),
+          item.note ? h("span", null, item.note) : null))) : null,
+        run.status !== "running" ? h("div", { className: "wx-feedback-form" },
+          h("label", null, "补充说明", h("textarea", { value: note, disabled: busy, rows: 2, onChange: (event) => setNote(event.target.value), placeholder: "指出判断依据、缺失内容或需要修改的地方…" })),
+          h("div", { role: "group", "aria-label": "评价这次真实案例" }, [
+            ["correct", "正确"], ["needs_changes", "需要修改"], ["unacceptable", "不可接受"],
+          ].map(([verdict, label]) => h("button", { key: verdict, type: "button", disabled: busy, onClick: () => void submit(verdict) }, label))),
+          error ? h("p", { role: "alert" }, error) : null) : null);
+    }
+    function RealWorkPanel({ project, onRun, onFeedback, busy, canRun }) {
+      const [caseTitle, setCaseTitle] = React.useState("");
+      const [inputText, setInputText] = React.useState("{}");
+      const [error, setError] = React.useState("");
+      const realRuns = project.runs.order.map((runId) => project.runs.byId[runId]).filter((run) => run?.kind === "real").reverse();
+      const feedback = project.feedback.order.map((feedbackId) => project.feedback.byId[feedbackId]).filter(Boolean);
+      const run = async () => {
+        setError("");
+        let input;
+        try {
+          input = JSON.parse(inputText);
+          if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error();
+        } catch {
+          setError("真实工作输入必须是一个有效的 JSON 对象。");
+          return;
+        }
+        try { await onRun(caseTitle.trim(), input); setCaseTitle(""); }
+        catch (cause) { setError(cause?.message || "真实案例未能运行。"); }
+      };
+      return h("section", { className: "wx-real-work", "aria-labelledby": "wx-real-work-title" },
+        h("div", { className: "wx-real-work-head" }, h("h3", { id: "wx-real-work-title" }, "用真实案例做影子运行"),
+          project.maturity.stage === "can_try" ? h("span", { role: "status" }, "可以试用") : null),
+        h("p", null, "提交一份真实工作输入；运行只在当前项目的受限环境中发生，不会执行外部发送、删除或付款。"),
+        h("label", null, "真实案例名称", h("input", { value: caseTitle, disabled: busy || !canRun, onChange: (event) => setCaseTitle(event.target.value), placeholder: "例如：九月客户记录" })),
+        h("label", null, "真实工作输入（JSON）", h("textarea", { value: inputText, disabled: busy || !canRun, rows: 6, onChange: (event) => setInputText(event.target.value), spellCheck: false })),
+        h("button", { type: "button", className: "wx-primary", disabled: busy || !canRun || !caseTitle.trim() || !inputText.trim(), onClick: () => void run() }, busy ? "正在运行…" : "开始影子运行"),
+        !canRun ? h("small", null, "请先在主会话生成当前版本的工作 Agent。") : null,
+        error ? h("p", { role: "alert" }, error) : null,
+        realRuns.length ? h("div", { className: "wx-real-results", "aria-live": "polite" }, realRuns.map((item) => h(RealRunCard, {
+          key: item.runId, run: item, busy,
+          feedback: feedback.filter((entry) => entry.runId === item.runId),
+          onFeedback,
+        }))) : null);
+    }
     function RunEvidencePanel({ project, onRerun, rerunning, canRerun }) {
       const cases = project.evaluation.cases;
-      const runs = project.runs.order.map((runId) => project.runs.byId[runId]).filter(Boolean);
+      const runs = project.runs.order.map((runId) => project.runs.byId[runId])
+        .filter((run) => run && run.kind !== "real");
       const latestForCase = (caseId) => [...runs].reverse().find((run) => run.caseId === caseId);
       const statusLabel = (run) => {
         if (!run) return "未运行";
@@ -810,6 +926,9 @@ window.__ModuleLoader__.load({
       const canRerun = project.work.sessionId === sessionId
         && project.work.activeRevision === project.briefRevision
         && project.evaluation.cases.length > 0;
+      const canRunRealWork = project.work.sessionId === sessionId
+        && project.work.activeRevision === project.briefRevision
+        && Boolean(project.evaluation.agentVersion);
       const run = () => {
         const target = project.work.sessionId;
         if (canReturn && target) { rootContext.sessions.open(target); closeOverlay(); return; }
@@ -831,6 +950,11 @@ window.__ModuleLoader__.load({
           h("span", null, record.error),
           h("button", { type: "button", disabled: record.busy, onClick: () => void (record.errorCode === "workspace_outside_managed_root" ? importWorkspace(workspaceId) : loadProject(workspaceId)) },
             record.errorCode === "workspace_outside_managed_root" ? "导入项目" : "重新同步")) : null,
+        h(RealWorkPanel, {
+          project, busy: record.busy, canRun: canRunRealWork,
+          onRun: (caseTitle, input) => runRealWork(workspaceId, sessionId, caseTitle, input),
+          onFeedback: (runId, verdict, note) => submitRunFeedback(workspaceId, sessionId, runId, verdict, note),
+        }),
         h(RunEvidencePanel, {
           project, onRerun: () => void rerunEvaluation(workspaceId, sessionId), rerunning: record.busy, canRerun,
         }),
@@ -1188,6 +1312,7 @@ window.__ModuleLoader__.load({
         .wx-badge{display:inline-flex;align-items:center;gap:7px;min-height:30px;padding:5px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:500 12px/18px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer;transition:background-color .14s ease,border-color .14s ease}.wx-badge:hover{background:var(--dsw-alias-interactive-bg-hover)}.wx-badge[data-tone=active]{border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 42%,var(--dsw-alias-border-l2));color:var(--dsw-alias-state-business-primary)}.wx-badge[data-tone=attention]{color:var(--dsw-alias-state-warn-primary)}.wx-badge[data-tone=problem]{color:var(--dsw-alias-state-error-primary)}
         .wx-backdrop{pointer-events:auto;position:fixed;inset:0;border:0;background:rgba(14,20,18,.34);backdrop-filter:blur(2px);animation:wx-fade-in .16s ease both}.wx-drawer{pointer-events:auto;box-sizing:border-box;position:fixed;z-index:2;inset:0 0 0 auto;width:min(420px,calc(100vw - 24px));padding:26px 24px 36px;overflow:auto;overscroll-behavior:contain;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-left:1px solid var(--dsw-alias-border-l2);box-shadow:-20px 0 56px rgba(13,24,20,.18);font-family:var(--ds-font-family-text,ui-sans-serif,system-ui);animation:wx-drawer-in .16s ease-out both;outline:none}.wx-drawer :is(button,input,textarea):focus-visible,.wx-guidance button:focus-visible,.wx-side:focus-visible,.wx-badge:focus-visible,.wx-model-inline button:focus-visible,.wx-tool-brief button:focus-visible,.wx-rerun:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}.wx-close{position:absolute;top:16px;right:16px;width:36px;height:36px;display:grid;place-items:center;border:0;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}.wx-close:hover{background:var(--dsw-alias-interactive-bg-hover)}
         .wx-panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-right:40px;margin-bottom:18px}.wx-panel-head p,.wx-community-head p{margin:0 0 4px;color:var(--dsw-alias-state-business-primary);font:650 10px/15px var(--ds-font-family-code,ui-monospace,monospace);letter-spacing:.12em;text-transform:uppercase}.wx-panel-head h2,.wx-community-head h2{margin:0;font:560 28px/1.25 ui-serif,"Songti SC","STSong",serif}.wx-panel-status{flex:none;margin-top:4px;padding:4px 8px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:11px}.wx-panel-status[data-tone=active]{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent);color:var(--dsw-alias-state-business-primary)}.wx-panel-status[data-tone=problem]{color:var(--dsw-alias-state-error-primary)}.wx-project-name{display:block;margin-bottom:14px;color:var(--dsw-alias-label-tertiary);font-size:11px}.wx-project-name input{box-sizing:border-box;width:100%;height:38px;margin-top:6px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:500 13px/20px var(--ds-font-family-text,ui-sans-serif,system-ui);outline:none}.wx-project-name input:focus,.wx-brief-field textarea:focus,.wx-community-input:focus{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent)}
+        .wx-real-work{margin:0 0 18px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 4%,var(--dsw-alias-bg-base))}.wx-real-work-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.wx-real-work h3{margin:0;font:600 14px/1.4 ui-serif,"Songti SC","STSong",serif}.wx-real-work-head span{padding:3px 7px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent);color:var(--dsw-alias-state-success-primary);font-size:10px}.wx-real-work>p{margin:7px 0;color:var(--dsw-alias-label-secondary);font-size:10px;line-height:1.5}.wx-real-work>label,.wx-feedback-form>label{display:block;margin-top:9px;color:var(--dsw-alias-label-tertiary);font-size:10px}.wx-real-work input,.wx-real-work textarea{box-sizing:border-box;width:100%;margin-top:5px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:11px/1.5 var(--ds-font-family-code,ui-monospace,monospace);resize:vertical}.wx-real-work>.wx-primary{width:100%;min-height:36px;margin-top:9px}.wx-real-work>small{display:block;margin-top:6px;color:var(--dsw-alias-label-caption);font-size:9px}.wx-real-results{display:grid;gap:8px;margin-top:12px}.wx-real-result{padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}.wx-real-result>header{display:flex;align-items:center;justify-content:space-between;gap:8px}.wx-real-result>header strong{font-size:11px}.wx-real-result>header span{color:var(--dsw-alias-label-secondary);font-size:9px}.wx-real-result>small{display:block;margin-top:4px;color:var(--dsw-alias-label-caption);font:9px/1.4 var(--ds-font-family-code,ui-monospace,monospace)}.wx-real-result details{margin-top:7px}.wx-real-result summary{color:var(--dsw-alias-label-secondary);font-size:10px;cursor:pointer}.wx-real-result pre{max-height:180px;margin:5px 0 0;padding:7px;overflow:auto;border-radius:7px;background:var(--dsw-alias-bg-base);white-space:pre-wrap;overflow-wrap:anywhere;font-size:9px}.wx-real-result ol,.wx-member-feedback{margin:6px 0 0;padding-left:18px;color:var(--dsw-alias-label-secondary);font-size:9px}.wx-real-result ol li{display:flex;justify-content:space-between;gap:8px}.wx-member-feedback{list-style:none;padding:0;display:grid;gap:4px}.wx-member-feedback li{display:flex;gap:6px}.wx-feedback-form>div{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:6px}.wx-feedback-form button{min-height:30px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font-size:9px;cursor:pointer}.wx-feedback-form button:first-child{color:var(--dsw-alias-state-success-primary)}.wx-feedback-form button:last-child{color:var(--dsw-alias-state-error-primary)}
         .wx-evidence{margin:0 0 18px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:var(--dsw-alias-bg-base)}.wx-evidence-head{display:grid;gap:10px}.wx-evidence h3,.wx-evidence h4{margin:0;font:600 14px/1.4 ui-serif,"Songti SC","STSong",serif}.wx-evidence h4{margin-top:14px;font-size:12px}.wx-evidence dl{margin:0;display:grid;grid-template-columns:1fr 1fr;gap:7px}.wx-evidence dl>div{padding:8px;border-radius:9px;background:var(--dsw-alias-bg-layer-1)}.wx-evidence dt{color:var(--dsw-alias-label-tertiary);font-size:9px}.wx-evidence dd{margin:3px 0 0;color:var(--dsw-alias-label-primary);font:650 11px/1.4 var(--ds-font-family-code,ui-monospace,monospace)}.wx-rerun{width:100%;min-height:36px;margin-top:10px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-state-business-primary);font:650 11px/16px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer}.wx-rerun:disabled{opacity:.45;cursor:default}.wx-evidence-note{margin:5px 2px 0;color:var(--dsw-alias-label-caption);font-size:9px;line-height:1.45}.wx-case-results,.wx-run-history ol{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}.wx-case-results li,.wx-run-history li{padding:9px;border:1px solid var(--dsw-alias-border-l1);border-radius:9px}.wx-case-results li>div{display:flex;align-items:center;gap:6px}.wx-case-results strong{font-size:11px}.wx-case-results li>div span{padding:2px 5px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);font-size:8px}.wx-case-results li>b{display:block;margin-top:4px;color:var(--dsw-alias-label-secondary);font-size:10px}.wx-case-results li[data-status=passed]>b{color:var(--dsw-alias-state-success-primary)}.wx-case-results li[data-status=failed]>b,.wx-case-results li[data-status=cancelled]>b{color:var(--dsw-alias-state-error-primary)}.wx-case-results p{margin:5px 0 0;color:var(--dsw-alias-state-error-primary);font-size:10px;line-height:1.45}.wx-case-results small{display:block;margin-top:4px;color:var(--dsw-alias-label-caption);font:9px/1.4 var(--ds-font-family-code,ui-monospace,monospace);overflow-wrap:anywhere}.wx-evidence-empty{margin:8px 0 0;color:var(--dsw-alias-label-tertiary);font-size:10px}.wx-run-history{margin-top:10px}.wx-run-history summary{color:var(--dsw-alias-label-secondary);font-size:10px;cursor:pointer}.wx-run-history li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px;color:var(--dsw-alias-label-tertiary);font:9px/1.4 var(--ds-font-family-code,ui-monospace,monospace)}.wx-run-history li>b{color:var(--dsw-alias-label-secondary)}.wx-run-history li>small,.wx-run-history li>p,.wx-run-input{grid-column:1/-1}.wx-run-input pre{max-height:160px;margin:5px 0 0;padding:7px;overflow:auto;border-radius:7px;background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;overflow-wrap:anywhere}.wx-run-history li>p{margin:0;color:var(--dsw-alias-state-error-primary);font:10px/1.45 var(--ds-font-family-text,ui-sans-serif,system-ui)}
         .wx-alert{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:10px 0;padding:10px 12px;border-radius:10px;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent);color:var(--dsw-alias-state-warn-primary);font-size:12px;line-height:1.55}.wx-alert[data-kind=error]{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 9%,transparent);color:var(--dsw-alias-state-error-primary)}.wx-alert[data-kind=success]{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 9%,transparent);color:var(--dsw-alias-state-success-primary)}.wx-alert button{flex:none;border:0;background:transparent;color:inherit;text-decoration:underline;cursor:pointer}
         .wx-brief-fields{display:flex;flex-direction:column;gap:10px}.wx-brief-field{padding:13px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:color-mix(in srgb,var(--dsw-alias-bg-base) 62%,var(--dsw-alias-bg-layer-1));transition:border-color .14s ease}.wx-brief-field:focus-within{border-color:var(--dsw-alias-border-l2)}.wx-field-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.wx-field-head>div{display:flex;align-items:baseline;gap:7px}.wx-field-head h3{margin:0;font:560 15px/1.35 ui-serif,"Songti SC","STSong",serif}.wx-field-head>div>span{color:var(--dsw-alias-label-caption);font-size:10px}.wx-source{flex:none;padding:3px 7px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);font:500 10px/15px var(--ds-font-family-code,ui-monospace,monospace)}.wx-source[data-source=user_confirmed]{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 11%,transparent);color:var(--dsw-alias-state-business-primary)}.wx-source[data-source=inferred]{background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent);color:var(--dsw-alias-state-warn-primary)}.wx-brief-field textarea,.wx-community-input{box-sizing:border-box;width:100%;min-height:62px;padding:8px 9px;border:1px solid transparent;border-radius:9px;background:transparent;color:var(--dsw-alias-label-primary);font:400 13px/1.62 var(--ds-font-family-text,ui-sans-serif,system-ui);resize:vertical;outline:none}.wx-brief-field textarea::placeholder,.wx-community-input::placeholder{color:var(--dsw-alias-label-caption)}.wx-field-foot{min-height:22px;margin-top:5px;display:flex;justify-content:space-between;align-items:center;gap:10px;color:var(--dsw-alias-label-caption);font-size:10px}.wx-field-foot button{border:0;border-radius:7px;padding:4px 8px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary);font:600 11px/16px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer}

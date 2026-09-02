@@ -1,13 +1,13 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { link, mkdir, unlink, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { DEFAULT_PROXY_RUN_CASE_ID, PROXY_RUN_CASE_IDS } from './evaluation-state.mjs';
+import { recordRunResult, RunEvidenceStore } from './run-evidence.mjs';
 
 export const PROXY_RUN_TOOL_NAME = 'wanxiang_run_evaluation';
 export const PROXY_RUN_EVAL_REVISION = 1;
 export const PROXY_RUN_WORKFLOW_NAME = 'wanxiang-preset-proxy-run';
 export const PROXY_RUN_WORKFLOW_VERSION = '2.0.0';
 export { DEFAULT_PROXY_RUN_CASE_ID, PROXY_RUN_CASE_IDS };
+export { RunEvidenceStore };
 
 const PROXY_RUN_SCRIPT = `const stable = (value) => {
   if (Array.isArray(value)) return value.map(stable);
@@ -130,35 +130,6 @@ export function createProxyRunProjectionDefinition() {
       view: (state) => state,
     },
   };
-}
-
-export class RunEvidenceStore {
-  constructor({ dataRoot, createPendingId = randomUUID }) {
-    this.dataRoot = dataRoot;
-    this.createPendingId = createPendingId;
-  }
-
-  async save(evidence) {
-    if (!this.dataRoot) throw proxyRunError('data_root_unavailable', '万象本地数据目录尚未配置。');
-    const directory = path.join(this.dataRoot, 'proxy-run-evidence', digest(evidence.projectId));
-    const filename = path.join(directory, `${digest(evidence.runId)}.json`);
-    const pending = path.join(directory, `.${digest(evidence.runId)}.${this.createPendingId()}.pending`);
-    await mkdir(directory, { recursive: true });
-    await writeFile(pending, `${JSON.stringify(evidence, null, 2)}\n`, {
-      encoding: 'utf8', mode: 0o600, flag: 'wx',
-    });
-    try {
-      await link(pending, filename);
-    } catch (error) {
-      if (error?.code === 'EEXIST') {
-        throw proxyRunError('evaluation_run_id_conflict', '这个代理运行 ID 已经存在，证据不能被覆盖。', 409);
-      }
-      throw error;
-    } finally {
-      await unlink(pending).catch(() => {});
-    }
-    return filename;
-  }
 }
 
 export function createPresetProxyRunWorkflowRequest(parent, signal) {
@@ -333,25 +304,28 @@ export function createProxyRunToolAdapter({
         const evidence = evaluationEvidence({
           runId, retryOf: runStart.retryOf, context, sessionId, evaluation, evalCase, startedAt, completedAt: now(), value,
         });
-        await recordEvaluationResult(
-          agent.session, evidenceStore, projectService, flushSession, evidence,
-          terminal?.conclusion ?? (evidence.status === 'passed' ? 'passed' : 'failed'), result.stopReason,
-        );
+        await recordRunResult({
+          session: agent.session, evidenceStore,
+          finishRun: (projectId, value) => projectService.finishEvaluationRun(projectId, value),
+          flushSession, evidence,
+          conclusion: terminal?.conclusion ?? (evidence.status === 'passed' ? 'passed' : 'failed'),
+          stopReason: result.stopReason,
+        });
         if (failure) {
           throw Object.assign(proxyRunError(failure.code, failure.message, failure.statusCode), {
-            evaluationTerminalCommitted: true,
+            runTerminalCommitted: true,
             evidence,
           });
         }
         if (evidence.status !== 'passed') {
           throw Object.assign(proxyRunError('proxy_run_assertion_failed', evidence.summary), {
-            evaluationTerminalCommitted: true,
+            runTerminalCommitted: true,
             evidence,
           });
         }
         return evidence;
       } catch (error) {
-        if (error?.evaluationTerminalCommitted) throw error;
+        if (error?.runTerminalCommitted) throw error;
         const failure = normalizeFailure(error, execution.signal);
         const terminal = terminalForFailure(failure);
         const evidence = evaluationEvidence({
@@ -364,12 +338,15 @@ export function createProxyRunToolAdapter({
           completedAt: now(),
           value: { status: terminal.status, summary: failure.message, assertions: [], error: failure },
         });
-        await recordEvaluationResult(
-          agent.session, evidenceStore, projectService, flushSession, evidence, terminal.conclusion,
-          terminal.status === 'cancelled' ? 'cancelled' : 'error',
-        );
+        await recordRunResult({
+          session: agent.session, evidenceStore,
+          finishRun: (projectId, value) => projectService.finishEvaluationRun(projectId, value),
+          flushSession, evidence,
+          conclusion: terminal.conclusion,
+          stopReason: terminal.status === 'cancelled' ? 'cancelled' : 'error',
+        });
         throw Object.assign(error instanceof Error ? error : new Error(failure.message), failure, {
-          evaluationTerminalCommitted: true,
+          runTerminalCommitted: true,
           evidence,
         });
       }
@@ -406,33 +383,6 @@ function evaluationVersionTrace(evaluation, workBriefRevision) {
   };
 }
 
-async function recordEvaluationResult(session, evidenceStore, projectService, flushSession, evidence, conclusion, stopReason) {
-  await evidenceStore.save(evidence);
-  const eventEvidence = {
-    input: evidence.input,
-    summary: evidence.summary,
-    assertions: evidence.assertions,
-    ...(evidence.output ? { output: evidence.output } : {}),
-    ...(evidence.error ? { error: evidence.error } : {}),
-  };
-  const terminal = {
-    runId: evidence.runId,
-    status: evidence.status,
-    conclusion,
-    completedAt: evidence.completedAt,
-    evidence: eventEvidence,
-  };
-  await projectService.finishEvaluationRun(evidence.projectId, terminal);
-  try {
-    session.append('tool-workflow/run-end', { ...terminal, stopReason });
-    await flushSession(session);
-  } catch (error) {
-    const persistenceError = error instanceof Error
-      ? error
-      : proxyRunError('proxy_run_session_persistence_failed', 'DSH 会话未能持久化代理运行结论。');
-    throw Object.assign(persistenceError, { evaluationTerminalCommitted: true });
-  }
-}
 
 function normalizeFailure(error, signal) {
   const cancelled = signal?.aborted || error?.name === 'AbortError' || error?.code === 'workflow_cancelled';
@@ -491,10 +441,6 @@ function proxyRunProjectionSchema() {
       return value;
     },
   };
-}
-
-function digest(value) {
-  return createHash('sha256').update(String(value)).digest('hex');
 }
 
 function proxyRunError(code, message, statusCode = 500) {

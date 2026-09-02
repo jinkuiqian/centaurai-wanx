@@ -431,7 +431,7 @@ test('DSH start fact persistence failure finalizes the protected project run wit
 
   await assert.rejects(
     tool.execute({ caseId }, { agent, signal: new AbortController().signal }),
-    (error) => error.code === 'session_flush_failed' && error.evaluationTerminalCommitted === true,
+    (error) => error.code === 'session_flush_failed' && error.runTerminalCommitted === true,
   );
 
   assert.equal(runnerCalls, 0);
@@ -506,7 +506,7 @@ test('DSH terminal fact persistence failure does not rewrite an already finalize
 
   await assert.rejects(
     tool.execute({ caseId }, { agent, signal: new AbortController().signal }),
-    (error) => error.code === 'session_flush_failed' && error.evaluationTerminalCommitted === true,
+    (error) => error.code === 'session_flush_failed' && error.runTerminalCommitted === true,
   );
 
   assert.equal(evidenceSaves, 1);
@@ -689,14 +689,61 @@ test('proxy-run evidence is persisted outside project code under stable run iden
 
   const filename = await store.save(evidence);
 
-  assert.ok(filename.startsWith(path.join(dataRoot, 'proxy-run-evidence')));
+  assert.ok(filename.startsWith(path.join(dataRoot, 'run-evidence')));
   assert.deepEqual(JSON.parse(await readFile(filename, 'utf8')), evidence);
   assert.doesNotMatch(path.relative(dataRoot, filename), /run\/unsafe|project\/unsafe/u);
 
   await assert.rejects(store.save({ ...evidence, status: 'failed', summary: '冲突结论' }), {
-    code: 'evaluation_run_id_conflict',
+    code: 'run_id_conflict',
   });
+  assert.equal(await store.save(evidence), filename);
+
+  const abandoned = await store.prepare({ ...evidence, runId: 'run-never-committed' });
+  assert.equal(await store.recover(async () => false), 0);
+  await assert.rejects(readFile(abandoned.pending, 'utf8'), { code: 'ENOENT' });
+  await assert.rejects(readFile(abandoned.filename, 'utf8'), { code: 'ENOENT' });
+
+  const orphan = { ...evidence, runId: 'run-awaiting-publish' };
+  const prepared = await store.prepare(orphan);
+  assert.equal(await store.recover(async (candidate) => candidate.runId === orphan.runId), 1);
+  assert.deepEqual(JSON.parse(await readFile(prepared.filename, 'utf8')), orphan);
   assert.deepEqual(JSON.parse(await readFile(filename, 'utf8')), evidence);
+});
+
+test('evidence recovery blocks new prepares until authoritative pending checks finish', async (t) => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'wanxiang-run-recovery-'));
+  t.after(() => rm(dataRoot, { recursive: true, force: true }));
+  const store = new RunEvidenceStore({ dataRoot, createPendingId: sequenceClock('old', 'new') });
+  const evidence = {
+    runId: 'old-run', projectId: 'project-1', sessionId: 'session-1', caseId: 'case-1',
+    workflowVersion: '1.0.0', evalRevision: 1, workBriefRevision: 1, retryOf: null,
+    status: 'passed', startedAt: '2026-09-02T10:00:00.000Z',
+    completedAt: '2026-09-02T10:00:01.000Z', input: {}, summary: '完成', assertions: [],
+  };
+  await store.prepare(evidence);
+  let releaseAuthority;
+  let authorityStarted;
+  const authorityReady = new Promise((resolve) => { authorityStarted = resolve; });
+  const authorityGate = new Promise((resolve) => { releaseAuthority = resolve; });
+  const recovery = store.recover(async () => {
+    authorityStarted();
+    await authorityGate;
+    return false;
+  });
+  await authorityReady;
+  let newPrepareFinished = false;
+  const newPrepare = store.prepare({ ...evidence, runId: 'new-run' }).then((value) => {
+    newPrepareFinished = true;
+    return value;
+  });
+  await Promise.resolve();
+  assert.equal(newPrepareFinished, false);
+
+  releaseAuthority();
+  await recovery;
+  const prepared = await newPrepare;
+  assert.equal(newPrepareFinished, true);
+  await store.abort(prepared);
 });
 
 function sequenceClock(...values) {

@@ -9,6 +9,8 @@ import {
   createAutomaticEvaluationHooks,
   createDiscoveryAuthorizationGuard,
   createEvaluationApiHandler,
+  createRealWorkRunApiHandler,
+  createRunFeedbackApiHandler,
   createProjectResponse,
   createPublicWebFetchTool,
   createWorkAgentGenerationTool,
@@ -17,10 +19,11 @@ import {
   evaluationPolicy,
   inject,
   renderPromptWorkDescription,
+  terminalRunMatchesEvidence,
 } from '../src/policy.mjs';
 import { createInitialState, deriveProjectState, serviceError, updateProjectState } from '../src/project-state.mjs';
 
-test('workbench composition registers the proxy-run tool adapter and DSH projection seams', () => {
+test('workbench composition registers separate proxy and real-run DSH projection seams', () => {
   const registeredTools = new Map();
   const projections = new Map();
   const ctx = {
@@ -59,6 +62,35 @@ test('workbench composition registers the proxy-run tool adapter and DSH project
   assert.equal(registeredTools.get('wanxiang_run_evaluation')?.name, 'wanxiang_run_evaluation');
   assert.equal(registeredTools.get('wanxiang_generate_work_agent')?.name, 'wanxiang_generate_work_agent');
   assert.equal(projections.get('wanxiang.proxy-run')?.stateVersion, 3);
+  assert.equal(projections.get('wanxiang.work-run')?.stateVersion, 1);
+});
+
+test('pending evidence recovery only accepts evidence matching the authoritative terminal run', () => {
+  const evidence = {
+    runId: 'run-real-1', projectId: 'workspace-1', sessionId: 'session-root', caseId: 'real-case-1',
+    caseTitle: '九月客户记录', kind: 'real', agentVersion: '1.0.0', workflowVersion: '1.0.0',
+    evalRevision: 2, workBriefRevision: 3, retryOf: null, status: 'passed',
+    startedAt: '2026-09-02T10:00:00.000Z', completedAt: '2026-09-02T10:00:01.000Z',
+    input: { transcript: '客户希望下周回访' }, summary: '工作 Agent 已完成影子运行。',
+    output: { action: '安排回访' }, steps: [], taskSteps: [],
+  };
+  const run = {
+    ...evidence,
+    runtimeInstanceId: 'runtime-1',
+    conclusion: 'passed',
+    evidence: {
+      input: evidence.input, summary: evidence.summary, kind: 'real', caseTitle: evidence.caseTitle,
+      steps: [], taskSteps: [], output: evidence.output,
+    },
+  };
+
+  assert.equal(terminalRunMatchesEvidence({ runs: { byId: { 'run-real-1': run } } }, evidence), true);
+  assert.equal(terminalRunMatchesEvidence(
+    { runs: { byId: { 'run-real-1': run } } }, { ...evidence, status: 'failed' },
+  ), false);
+  assert.equal(terminalRunMatchesEvidence({
+    runs: { byId: { 'run-real-1': { ...run, status: 'running' } } },
+  }, evidence), false);
 });
 
 test('work Agent generation tool derives the confirmed contract from the active root session', async () => {
@@ -806,6 +838,51 @@ test('manual rerun API executes the current Eval through the live canonical sess
   assert.equal(execution.value.agent, agent);
   assert.equal(body.evaluationRun.status, 'passed');
   assert.equal(body.state, state);
+});
+
+test('real work APIs run member input and append version-bound feedback through the canonical session', async () => {
+  const { ctx, agent } = activationContext('workspace-write');
+  const state = activationState('active');
+  let runExecution;
+  let feedbackRequest;
+  const service = {
+    async contextForAgent(actual) {
+      assert.equal(actual, agent);
+      return { workspaceId: 'workspace-1', state };
+    },
+    async getProjectEvidence() {
+      return { state, evaluation: { agentVersion: '1.0.0', workflowVersion: '1.0.0', evalRevision: 2, cases: [] } };
+    },
+    async recordRunFeedback(workspaceId, baseVersion, value, sessionId) {
+      feedbackRequest = { workspaceId, baseVersion, value, sessionId };
+      return state;
+    },
+  };
+  const workRun = {
+    async execute(args, value) {
+      runExecution = { args, value };
+      return { runId: 'run-real-1', status: 'passed', output: { action: '安排回访' } };
+    },
+  };
+
+  const [runStatus, runBody] = await createRealWorkRunApiHandler(ctx, service, workRun)(jsonRequest('POST', {
+    workspaceId: 'workspace-1', sessionId: 'session-root', caseTitle: '九月客户记录',
+    input: { transcript: '客户希望下周回访' },
+  }));
+  assert.equal(runStatus, 200);
+  assert.deepEqual(runExecution.args, { caseTitle: '九月客户记录', input: { transcript: '客户希望下周回访' } });
+  assert.equal(runExecution.value.agent, agent);
+  assert.equal(runBody.workRun.runId, 'run-real-1');
+
+  const [feedbackStatus] = await createRunFeedbackApiHandler(ctx, service)(jsonRequest('POST', {
+    workspaceId: 'workspace-1', sessionId: 'session-root', baseVersion: 7,
+    runId: 'run-real-1', verdict: 'needs_changes', note: '缺少负责人。',
+  }));
+  assert.equal(feedbackStatus, 200);
+  assert.deepEqual(feedbackRequest, {
+    workspaceId: 'workspace-1', baseVersion: 7,
+    value: { runId: 'run-real-1', verdict: 'needs_changes', note: '缺少负责人。' }, sessionId: 'session-root',
+  });
 });
 
 function activationState(status) {

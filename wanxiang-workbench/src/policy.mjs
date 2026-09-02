@@ -9,12 +9,13 @@ import {
   serviceError,
 } from './project-state.mjs';
 import {
-  RunEvidenceStore,
   createProxyRunProjectionDefinition,
   createProxyRunToolAdapter,
 } from './proxy-run.mjs';
 import { EvaluationProjectStore, WORKFLOW_ENTRYPOINT, WORKFLOW_MANIFEST } from './evaluation-state.mjs';
 import { RestrictedWorkflowRunner } from './restricted-runner.mjs';
+import { RunEvidenceStore, eventEvidenceForRun } from './run-evidence.mjs';
+import { createWorkRunAdapter, createWorkRunProjectionDefinition } from './work-run.mjs';
 
 /** Wanxiang's product policy and browser branding, composed into every session. */
 export const name = 'wanxiang-workbench';
@@ -87,6 +88,13 @@ export function apply(ctx) {
     evidenceStore: runEvidenceStore,
     flushSession: (session) => ctx.sessions.flush(session),
   });
+  const workRun = createWorkRunAdapter({
+    projectService: service,
+    evaluationStore,
+    runner,
+    evidenceStore: runEvidenceStore,
+    flushSession: (session) => ctx.sessions.flush(session),
+  });
   const generationEvaluations = new WeakSet();
   const automaticEvaluation = createAutomaticEvaluationHooks({
     projectService: service,
@@ -95,9 +103,14 @@ export function apply(ctx) {
     evaluatedExecutions: generationEvaluations,
   });
   void service.prepareRoots().catch(() => {});
+  void runEvidenceStore.recover(async (evidence) => {
+    const state = await service.getProject(String(evidence.projectId));
+    return terminalRunMatchesEvidence(state, evidence);
+  }).catch(() => {});
 
   ctx.effect(() => ctx.tools.register(createWorkBriefTool(service)));
   ctx.effect(() => ctx.sessionProjections.register(createProxyRunProjectionDefinition()));
+  ctx.effect(() => ctx.sessionProjections.register(createWorkRunProjectionDefinition()));
   ctx.effect(() => ctx.tools.register(evaluationTool));
   ctx.effect(() => ctx.tools.register(createWorkAgentGenerationTool(
     service, evaluationStore, evaluationTool, generationEvaluations,
@@ -228,6 +241,8 @@ export function apply(ctx) {
 
   registerApi(ctx, '/api/wanxiang/activation', createActivationApiHandler(ctx, service, authorization));
   registerApi(ctx, '/api/wanxiang/evaluation/rerun', createEvaluationApiHandler(ctx, service, evaluationTool));
+  registerApi(ctx, '/api/wanxiang/work-run', createRealWorkRunApiHandler(ctx, service, workRun));
+  registerApi(ctx, '/api/wanxiang/run-feedback', createRunFeedbackApiHandler(ctx, service));
 
   // v0.2 clients may still finish an already-reserved operation while upgrading.
   registerApi(ctx, '/api/wanxiang/dispatch', async (request) => {
@@ -476,6 +491,45 @@ export function createEvaluationApiHandler(ctx, service, evaluationTool) {
     const evaluationRun = await evaluationTool.execute({}, { agent, signal: request.signal });
     const snapshot = await service.getProjectEvidence(workspaceId);
     return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation, evaluationRun })];
+  };
+}
+
+export function createRealWorkRunApiHandler(ctx, service, workRun) {
+  return async (request) => {
+    requireMethod(request, 'POST');
+    const payload = requireObject(await readJson(request));
+    rejectUnknownKeys(payload, ['workspaceId', 'sessionId', 'caseTitle', 'input'], '影子运行参数');
+    const workspaceId = requiredText(payload.workspaceId, '项目 ID', 200);
+    const sessionId = requiredText(payload.sessionId, '会话 ID', 200);
+    const caseTitle = requiredText(payload.caseTitle, '案例名称', 200);
+    const input = requireObject(payload.input, '真实工作输入必须是 JSON 对象。');
+    const agent = await requireActivationAgent(ctx, service, workspaceId, sessionId, { requireIdle: true });
+    if (typeof workRun?.execute !== 'function') {
+      throw serviceError(503, 'work_run_unavailable', '影子运行环境尚未就绪。');
+    }
+    const run = await workRun.execute({ caseTitle, input }, { agent, signal: request.signal });
+    const snapshot = await service.getProjectEvidence(workspaceId);
+    return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation, workRun: run })];
+  };
+}
+
+export function createRunFeedbackApiHandler(ctx, service) {
+  return async (request) => {
+    requireMethod(request, 'POST');
+    const payload = requireObject(await readJson(request));
+    rejectUnknownKeys(payload, ['workspaceId', 'sessionId', 'baseVersion', 'runId', 'verdict', 'note'], '运行反馈参数');
+    const workspaceId = requiredText(payload.workspaceId, '项目 ID', 200);
+    const sessionId = requiredText(payload.sessionId, '会话 ID', 200);
+    const baseVersion = nonNegativeInteger(payload.baseVersion, '基础版本', 1);
+    const runId = requiredText(payload.runId, '运行 ID', 200);
+    const verdict = enumValue(payload.verdict, '反馈结论', ['correct', 'needs_changes', 'unacceptable']);
+    const note = optionalText(payload.note, '反馈说明', 12_000) || '';
+    await requireActivationAgent(ctx, service, workspaceId, sessionId, { requireIdle: true });
+    const state = await service.recordRunFeedback(
+      workspaceId, baseVersion, { runId, verdict, note }, sessionId,
+    );
+    const snapshot = await service.getProjectEvidence(workspaceId);
+    return [200, createProjectResponse(state, { evaluation: snapshot.evaluation })];
   };
 }
 
@@ -783,6 +837,18 @@ export function createPublicWebFetchTool(web) {
 export function createProjectResponse(state, extra = {}) {
   const projection = deriveProjectState(state);
   return { ok: true, ...extra, state, projection, guidance: projection.guidance };
+}
+
+export function terminalRunMatchesEvidence(state, evidence) {
+  const run = state?.runs?.byId?.[evidence?.runId];
+  if (!run || run.status === 'running') return false;
+  for (const key of [
+    'runId', 'sessionId', 'caseId', 'kind', 'agentVersion', 'workflowVersion', 'evalRevision',
+    'workBriefRevision', 'retryOf', 'status', 'startedAt', 'completedAt',
+  ]) {
+    if ((run[key] ?? null) !== (evidence[key] ?? null)) return false;
+  }
+  return JSON.stringify(run.evidence) === JSON.stringify(eventEvidenceForRun(evidence));
 }
 
 function activationResponse(ctx, result) {

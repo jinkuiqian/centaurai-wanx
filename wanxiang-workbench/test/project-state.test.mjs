@@ -115,6 +115,7 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
         prompt: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
       },
     },
+    maturity: { stage: 'understanding', acceptedRealRunCount: 0 },
   });
 });
 
@@ -1042,6 +1043,107 @@ test('project evidence snapshot joins protected workflow, eval and run facts for
   assert.equal(snapshot.evaluation.evalRevision, 4);
   assert.deepEqual(snapshot.evaluation.cases, [{ id: 'case-1', title: '超过 14 天未跟进', kind: 'normal' }]);
   assert.equal(snapshot.state.runs.byId['run-1'].runId, 'run-1');
+});
+
+test('a real case and its member feedback stay immutable, survive restart and unlock tryout', async (t) => {
+  const root = await temporaryDirectory(t);
+  const dataRoot = await temporaryDirectory(t);
+  const workspace = { id: 'workspace-real-case', path: root, title: '项目', sessionIds: ['session-1'] };
+  const registry = registryFor(workspace);
+  const service = serviceFor(registry, { dataRoot, runtimeId: 'runtime-1' });
+  const started = await service.startRealWorkRun(workspace.id, {
+    runId: 'run-real-1',
+    sessionId: 'session-1',
+    caseId: 'real-case-1',
+    caseTitle: '九月客户记录',
+    agentVersion: '1.2.0',
+    workflowVersion: '1.2.0',
+    evalRevision: 4,
+    workBriefRevision: 3,
+    input: { transcript: '客户希望下周安排回访。' },
+    retryOf: null,
+    startedAt: '2026-09-02T10:00:00.000Z',
+  });
+  const finished = await service.finishEvaluationRun(workspace.id, {
+    runId: 'run-real-1',
+    status: 'passed',
+    conclusion: 'passed',
+    completedAt: '2026-09-02T10:00:01.000Z',
+    evidence: {
+      input: { transcript: '客户希望下周安排回访。' },
+      output: { action: '下周安排回访' },
+      summary: '工作 Agent 已完成真实案例。',
+      steps: [{ id: 'workflow-executed', label: '工作 Agent 已在受限环境完成', status: 'completed' }],
+    },
+  });
+  const historicalRun = structuredClone(finished.runs.byId['run-real-1']);
+
+  await assert.rejects(service.recordRunFeedback(workspace.id, finished.stateVersion, {
+    runId: 'run-real-1', verdict: 'correct', note: '来自另一个会话。',
+  }, 'session-2'), { code: 'run_feedback_session_mismatch', statusCode: 403 });
+
+  const withFeedback = await service.recordRunFeedback(workspace.id, finished.stateVersion, {
+    runId: 'run-real-1', verdict: 'correct', note: '结果可以直接使用。',
+  }, 'session-1');
+  const feedbackId = withFeedback.feedback.order[0];
+  const feedback = withFeedback.feedback.byId[feedbackId];
+  assert.match(feedback.createdAt, /^2026-01-01T00:00:/u);
+  assert.deepEqual({ ...feedback, createdAt: '<timestamp>' }, {
+    id: feedbackId,
+    workspaceId: workspace.id,
+    runId: 'run-real-1',
+    caseId: 'real-case-1',
+    verdict: 'correct',
+    note: '结果可以直接使用。',
+    workBriefRevision: 3,
+    agentVersion: '1.2.0',
+    createdAt: '<timestamp>',
+  });
+  assert.equal(deriveProjectState(withFeedback).maturity.stage, 'can_try');
+
+  const needsChanges = await service.recordRunFeedback(workspace.id, withFeedback.stateVersion, {
+    runId: 'run-real-1', verdict: 'needs_changes', note: '还要补充负责人。',
+  }, 'session-1');
+  const withAllFeedback = await service.recordRunFeedback(workspace.id, needsChanges.stateVersion, {
+    runId: 'run-real-1', verdict: 'unacceptable', note: '不能遗漏高风险客户。',
+  }, 'session-1');
+  assert.deepEqual(withAllFeedback.feedback.order.map((id) => withAllFeedback.feedback.byId[id].verdict), [
+    'correct', 'needs_changes', 'unacceptable',
+  ]);
+
+  const renamed = await service.updateProject(workspace.id, withAllFeedback.stateVersion, { projectName: '新版项目名称' });
+  assert.deepEqual(renamed.runs.byId['run-real-1'], historicalRun);
+  assert.deepEqual(renamed.feedback, withAllFeedback.feedback);
+
+  const restarted = serviceFor(registry, { dataRoot, runtimeId: 'runtime-2' });
+  const recovered = await restarted.getProject(workspace.id);
+  assert.deepEqual(recovered.runs.byId['run-real-1'], historicalRun);
+  assert.deepEqual(recovered.feedback, withAllFeedback.feedback);
+  assert.equal(deriveProjectState(recovered).maturity.stage, 'can_try');
+});
+
+test('a correct verdict on a failed real run does not unlock tryout', async (t) => {
+  const root = await temporaryDirectory(t);
+  const dataRoot = await temporaryDirectory(t);
+  const workspace = { id: 'workspace-failed-real-case', path: root, title: '项目', sessionIds: ['session-1'] };
+  const service = serviceFor(registryFor(workspace), { dataRoot, runtimeId: 'runtime-1' });
+  await service.startRealWorkRun(workspace.id, {
+    runId: 'run-real-failed-1', sessionId: 'session-1', caseId: 'real-case-failed-1',
+    caseTitle: '失败案例', agentVersion: '1.2.0', workflowVersion: '1.2.0', evalRevision: 4,
+    workBriefRevision: 3, input: { transcript: '客户希望下周回访。' }, retryOf: null,
+    startedAt: '2026-09-02T10:00:00.000Z',
+  });
+  const failed = await service.finishRun(workspace.id, {
+    runId: 'run-real-failed-1', status: 'failed', conclusion: 'failed',
+    completedAt: '2026-09-02T10:00:01.000Z',
+    evidence: { input: { transcript: '客户希望下周回访。' }, summary: '执行失败。' },
+  });
+  const withFeedback = await service.recordRunFeedback(workspace.id, failed.stateVersion, {
+    runId: 'run-real-failed-1', verdict: 'correct', note: '失败状态判断正确。',
+  }, 'session-1');
+
+  assert.equal(deriveProjectState(withFeedback).maturity.acceptedRealRunCount, 0);
+  assert.notEqual(deriveProjectState(withFeedback).maturity.stage, 'can_try');
 });
 
 test('project creation requires a host-owned root', async () => {

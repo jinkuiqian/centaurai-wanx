@@ -82,6 +82,24 @@ test('v0.3.6 manually reruns the current Eval from the accessible evidence panel
   assert.match(client, /if \(refreshing \|\| record\.busy\) return/u);
 });
 
+test('v0.3.7 runs a real case, shows reviewable evidence and records three member verdicts', () => {
+  assert.match(client, /apiJson\("\/api\/wanxiang\/work-run"/u);
+  assert.match(client, /apiJson\("\/api\/wanxiang\/run-feedback"/u);
+  assert.match(client, /function RealWorkPanel\(\{ project, onRun, onFeedback, busy, canRun \}\)/u);
+  for (const copy of ['真实案例名称', '真实工作输入（JSON）', '开始影子运行', '正确', '需要修改', '不可接受']) {
+    assert.match(client, new RegExp(copy, 'u'));
+  }
+  assert.match(client, /run\.evidence\?\.output[\s\S]*工作结果/u);
+  assert.match(client, /run\.evidence\?\.taskSteps[\s\S]*关键步骤/u);
+  assert.match(client, /运行事实/u);
+  assert.match(client, /run\.status !== "running"[\s\S]*wx-feedback-form/u);
+  assert.match(client, /project\.feedback\.order/u);
+  assert.match(client, /工作说明 v\$\{run\.workBriefRevision\}[\s\S]*Agent v\$\{run\.agentVersion\}/u);
+  assert.match(client, /project\.maturity\.stage === "can_try"[\s\S]*可以试用/u);
+  assert.match(client, /run && run\.kind !== "real"/u);
+  assert.match(client, /h\(RealWorkPanel, \{/u);
+});
+
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {
   assert.match(client, /function GuidanceDock\(\{ session, sessionId, input, inputActions \}\)/u);
   assert.match(client, /inputActions\.setDraft\(example\.draft\)/u);
