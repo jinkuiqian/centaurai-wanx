@@ -55,6 +55,20 @@ test('v0.3.4 distinguishes running, pass, partial failure, timeout and cancellat
   assert.match(client, /retryOf/u);
 });
 
+test('v0.3.5 restores protected workflow, eval and historical run evidence in the existing drawer', () => {
+  assert.match(client, /function RunEvidencePanel\(\{ project \}\)/u);
+  assert.match(client, /project\.evaluation\.workflowVersion/u);
+  assert.match(client, /project\.evaluation\.evalRevision/u);
+  assert.match(client, /project\.runs\.order/u);
+  for (const label of ['Workflow 版本', 'Eval 修订', '逐案例结果', '前次运行', '运行时重启']) {
+    assert.match(client, new RegExp(label, 'u'));
+  }
+  assert.match(client, /h\(RunEvidencePanel, \{ project \}\)/u);
+  assert.match(client, /"aria-live": "polite"/u);
+  assert.match(client, /wx-run-history[\s\S]*run\.evidence\?\.error\?\.message/u);
+  assert.match(client, /断言 \$\{passedAssertions\}\/\$\{assertions\.length\}/u);
+});
+
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {
   assert.match(client, /function GuidanceDock\(\{ session, sessionId, input, inputActions \}\)/u);
   assert.match(client, /inputActions\.setDraft\(example\.draft\)/u);

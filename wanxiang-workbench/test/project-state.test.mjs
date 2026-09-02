@@ -796,6 +796,63 @@ test('protected project state keeps immutable evaluation attempts and retry line
   assert.equal(mirror.runs.byId['run-1'].conclusion, 'timed_out');
 });
 
+test('runtime restart recovers unfinished evaluation attempts as explicit fail-closed evidence', async (t) => {
+  const root = await temporaryDirectory(t);
+  const dataRoot = await temporaryDirectory(t);
+  const workspace = { id: 'workspace-restart', path: root, title: '项目', sessionIds: ['session-1'] };
+  const registry = registryFor(workspace);
+  const firstRuntime = serviceFor(registry, { dataRoot, runtimeId: 'runtime-1' });
+  await firstRuntime.startEvaluationRun(workspace.id, {
+    runId: 'run-interrupted',
+    sessionId: 'session-1',
+    caseId: 'case-1',
+    workflowVersion: '2.0.0',
+    evalRevision: 1,
+    workBriefRevision: 1,
+    retryOf: null,
+    startedAt: '2026-09-02T10:00:00.000Z',
+  });
+
+  assert.equal((await firstRuntime.getProject(workspace.id)).runs.byId['run-interrupted'].status, 'running');
+
+  const restartedRuntime = serviceFor(registry, { dataRoot, runtimeId: 'runtime-2' });
+  const recovered = await restartedRuntime.getProject(workspace.id);
+  assert.equal(recovered.runs.byId['run-interrupted'].status, 'failed');
+  assert.equal(recovered.runs.byId['run-interrupted'].conclusion, 'interrupted');
+  assert.equal(recovered.runs.byId['run-interrupted'].evidence.error.code, 'runtime_restarted');
+
+  const canonical = JSON.parse(await readFile(canonicalProjectStatePath(dataRoot, workspace.id), 'utf8'));
+  const mirror = JSON.parse(await readFile(path.join(root, '.wanxiang', 'project.json'), 'utf8'));
+  assert.equal(canonical.runs.byId['run-interrupted'].conclusion, 'interrupted');
+  assert.equal(mirror.runs.byId['run-interrupted'].conclusion, 'interrupted');
+});
+
+test('project evidence snapshot joins protected workflow, eval and run facts for refresh recovery', async (t) => {
+  const root = await temporaryDirectory(t);
+  const dataRoot = await temporaryDirectory(t);
+  const workspace = { id: 'workspace-evidence', path: root, title: '项目', sessionIds: ['session-1'] };
+  const evaluationStore = {
+    async load(project) {
+      assert.deepEqual(project, { workspaceId: workspace.id, workspacePath: root });
+      return {
+        workflow: { workflowVersion: '2.3.0' },
+        eval: { revision: 4, cases: [{ id: 'case-1', title: '超过 14 天未跟进', kind: 'normal', input: {}, expected: {} }] },
+      };
+    },
+  };
+  const service = serviceFor(registryFor(workspace), { dataRoot, evaluationStore, runtimeId: 'runtime-1' });
+  await service.startEvaluationRun(workspace.id, {
+    runId: 'run-1', sessionId: 'session-1', caseId: 'case-1', workflowVersion: '2.3.0',
+    evalRevision: 4, workBriefRevision: 1, retryOf: null, startedAt: '2026-09-02T10:00:00.000Z',
+  });
+
+  const snapshot = await service.getProjectEvidence(workspace.id);
+  assert.equal(snapshot.evaluation.workflowVersion, '2.3.0');
+  assert.equal(snapshot.evaluation.evalRevision, 4);
+  assert.deepEqual(snapshot.evaluation.cases, [{ id: 'case-1', title: '超过 14 天未跟进', kind: 'normal' }]);
+  assert.equal(snapshot.state.runs.byId['run-1'].runId, 'run-1');
+});
+
 test('project creation requires a host-owned root', async () => {
   const service = serviceFor(registryFor());
   await assert.rejects(service.createProject('新项目'), { code: 'project_root_unavailable', statusCode: 503 });
@@ -807,6 +864,8 @@ function serviceFor(workspaceRegistry, options = {}) {
     workspaceRegistry,
     projectsRoot: Object.hasOwn(options, 'projectsRoot') ? options.projectsRoot : workspaceRegistry.managedRoot || null,
     dataRoot: options.dataRoot || null,
+    evaluationStore: options.evaluationStore || null,
+    runtimeId: options.runtimeId,
     now: () => `2026-01-01T00:00:0${Math.min(sequence, 9)}.000Z`,
     id: () => `id-${++sequence}`,
   });

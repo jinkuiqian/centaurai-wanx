@@ -70,7 +70,7 @@ function initialEvaluationRuns() {
   return { latestRunId: null, order: [], byId: {} };
 }
 
-function startEvaluationRunState(current, input) {
+function startEvaluationRunState(current, input, runtimeId) {
   if (!isEvaluationRunStart(input)) {
     throw serviceError(400, 'evaluation_run_invalid', '代理运行证据无效。');
   }
@@ -85,6 +85,7 @@ function startEvaluationRunState(current, input) {
   }
   const run = {
     ...structuredClone(input),
+    runtimeInstanceId: runtimeId,
     status: 'running',
     completedAt: null,
     conclusion: null,
@@ -414,13 +415,14 @@ export function renderBrief({ projectName, brief }) {
 }
 
 export class WanxiangStateService {
-  constructor({ workspaceRegistry, projectsRoot, dataRoot, evaluationStore = null, now = () => new Date().toISOString(), id = randomUUID }) {
+  constructor({ workspaceRegistry, projectsRoot, dataRoot, evaluationStore = null, now = () => new Date().toISOString(), id = randomUUID, runtimeId = randomUUID() }) {
     this.workspaceRegistry = workspaceRegistry;
     this.projectsRoot = projectsRoot;
     this.dataRoot = dataRoot;
     this.evaluationStore = evaluationStore;
     this.now = now;
     this.id = id;
+    this.runtimeId = runtimeId;
   }
 
   async prepareRoots() {
@@ -469,12 +471,7 @@ export class WanxiangStateService {
       });
     }
     try {
-      const state = await withSerialLock(workspaceLocks, String(workspace.id), () => loadOrMigrate(
-        workspace,
-        this.now(),
-        this.id,
-        this.dataRoot,
-      ));
+      const state = await withSerialLock(workspaceLocks, String(workspace.id), () => this.#loadState(workspace));
       return { workspace, state };
     } catch (error) {
       if (imported) {
@@ -530,19 +527,34 @@ export class WanxiangStateService {
 
   async getProject(workspaceId) {
     const workspace = await this.resolveWorkspace(workspaceId);
-    return withSerialLock(workspaceLocks, String(workspace.id), () => loadOrMigrate(
-      workspace,
-      this.now(),
-      this.id,
-      this.dataRoot,
-    ));
+    return withSerialLock(workspaceLocks, String(workspace.id), () => this.#loadState(workspace));
+  }
+
+  async getProjectEvidence(workspaceId) {
+    const workspace = await this.resolveWorkspace(workspaceId);
+    return withSerialLock(workspaceLocks, String(workspace.id), async () => {
+      const state = await this.#loadState(workspace);
+      if (!this.evaluationStore) return { state, evaluation: null };
+      const evaluation = await this.evaluationStore.load({
+        workspaceId: String(workspace.id),
+        workspacePath: workspace.path,
+      });
+      return {
+        state,
+        evaluation: {
+          workflowVersion: evaluation.workflow.workflowVersion,
+          evalRevision: evaluation.eval.revision,
+          cases: evaluation.eval.cases.map(({ id, title, kind }) => ({ id, title, kind })),
+        },
+      };
+    });
   }
 
   async startEvaluationRun(workspaceId, input) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
-      const next = startEvaluationRunState(current, input);
+      const current = await this.#loadState(workspace);
+      const next = startEvaluationRunState(current, input, this.runtimeId);
       await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
     });
@@ -551,7 +563,7 @@ export class WanxiangStateService {
   async finishEvaluationRun(workspaceId, input) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const current = await this.#loadState(workspace);
       const next = finishEvaluationRunState(current, input);
       if (next !== current) await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
@@ -561,7 +573,7 @@ export class WanxiangStateService {
   async updateProject(workspaceId, baseVersion, update) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const current = await this.#loadState(workspace);
       assertBaseVersion(current, baseVersion);
       const next = updateProjectState(current, update, this.now());
       if (next !== current) await writeProjectState(workspace, next, this.dataRoot, this.id);
@@ -579,7 +591,7 @@ export class WanxiangStateService {
   async confirmProject(workspaceId, baseVersion, briefRevision) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const current = await this.#loadState(workspace);
       assertBaseVersion(current, baseVersion);
       const next = confirmProjectState(current, briefRevision, this.now());
       const root = path.join(workspace.path, '.wanxiang');
@@ -608,7 +620,7 @@ export class WanxiangStateService {
   async reserveActivation(workspaceId, request) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const current = await this.#loadState(workspace);
       assertBaseVersion(current, request.baseVersion);
       const sameOpenActivation = current.work.activation?.briefRevision === request.briefRevision
         && ['pending', 'active'].includes(current.work.activation.status);
@@ -643,7 +655,7 @@ export class WanxiangStateService {
   async finalizeActivation(workspaceId, request) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const current = await this.#loadState(workspace);
       const next = finalizeActivation(current, request, this.now());
       if (next !== current) await writeProjectState(workspace, next, this.dataRoot, this.id);
       if (next !== current && request.status === 'failed') {
@@ -656,7 +668,7 @@ export class WanxiangStateService {
   async reserveDispatch(workspaceId, request) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const current = await this.#loadState(workspace);
       const result = reserveDispatch(current, request, this.now(), this.id());
       if (result.state !== current) await writeProjectState(workspace, result.state, this.dataRoot, this.id);
       return result;
@@ -666,7 +678,7 @@ export class WanxiangStateService {
   async finalizeDispatch(workspaceId, request) {
     const workspace = await this.resolveWorkspace(workspaceId);
     return withSerialLock(workspaceLocks, String(workspace.id), async () => {
-      const current = await loadOrMigrate(workspace, this.now(), this.id, this.dataRoot);
+      const current = await this.#loadState(workspace);
       const next = finalizeDispatch(current, request, this.now());
       if (next !== current) await writeProjectState(workspace, next, this.dataRoot, this.id);
       return next;
@@ -679,23 +691,13 @@ export class WanxiangStateService {
 
   async getSessionContext(workspaceId, sessionId) {
     const workspace = await this.#resolveSessionWorkspace(workspaceId, sessionId);
-    const state = await withSerialLock(workspaceLocks, String(workspace.id), () => loadOrMigrate(
-      workspace,
-      this.now(),
-      this.id,
-      this.dataRoot,
-    ));
+    const state = await withSerialLock(workspaceLocks, String(workspace.id), () => this.#loadState(workspace));
     return this.#sessionContextValue(state, sessionId);
   }
 
   async setSessionContext(workspaceId, sessionId, enabled) {
     const workspace = await this.#resolveSessionWorkspace(workspaceId, sessionId);
-    const state = await withSerialLock(workspaceLocks, String(workspace.id), () => loadOrMigrate(
-      workspace,
-      this.now(),
-      this.id,
-      this.dataRoot,
-    ));
+    const state = await withSerialLock(workspaceLocks, String(workspace.id), () => this.#loadState(workspace));
     const builder = state.work.sessionId === sessionId;
     if (!builder && state.brief.confirmedRevision !== null) {
       await this.#withSessionContexts(async (store, save) => {
@@ -710,12 +712,7 @@ export class WanxiangStateService {
     const sessionId = String(agent?.id || '');
     const workspace = await this.#workspaceForAgent(agent);
     if (!workspace) return null;
-    const state = await withSerialLock(workspaceLocks, String(workspace.id), () => loadOrMigrate(
-      workspace,
-      this.now(),
-      this.id,
-      this.dataRoot,
-    ));
+    const state = await withSerialLock(workspaceLocks, String(workspace.id), () => this.#loadState(workspace));
     if (this.evaluationStore) {
       await this.evaluationStore.load({ workspaceId: String(workspace.id), workspacePath: workspace.path });
     }
@@ -735,6 +732,10 @@ export class WanxiangStateService {
       if (error?.code !== 'ENOENT') throw error;
     }
     return { ...base, text };
+  }
+
+  async #loadState(workspace) {
+    return loadOrMigrate(workspace, this.now(), this.id, this.dataRoot, this.runtimeId);
   }
 
   async addOutboxItem(input) {
@@ -1002,7 +1003,7 @@ function isPlaceholder(value) {
   return !text || /^(?:待在.+继续确认|待补充|待填写|待确认|未填写|todo|n\/a)$/iu.test(text);
 }
 
-async function loadOrMigrate(workspace, timestamp, id, dataRoot) {
+async function loadOrMigrate(workspace, timestamp, id, dataRoot, runtimeId) {
   await ensureManagedArtifacts(workspace.path, id);
   const root = path.join(workspace.path, '.wanxiang');
   const mirror = path.join(root, 'project.json');
@@ -1012,10 +1013,11 @@ async function loadOrMigrate(workspace, timestamp, id, dataRoot) {
   if (canonical) {
     const stored = await readStoredState(canonical, recoverConfirmedAnswers);
     if (stored) {
-      if (stored.migrated) await writeCanonicalProjectFile(canonical, stored.state, id);
-      await syncProjectMirror(mirror, stored.state, id).catch(() => {});
-      await reconcileBriefArtifact(workspace.path, stored.state, id);
-      return stored.state;
+      const state = recoverInterruptedEvaluationRuns(stored.state, runtimeId, timestamp);
+      if (stored.migrated || state !== stored.state) await writeCanonicalProjectFile(canonical, state, id);
+      await syncProjectMirror(mirror, state, id).catch(() => {});
+      await reconcileBriefArtifact(workspace.path, state, id);
+      return state;
     }
   }
 
@@ -1031,11 +1033,40 @@ async function loadOrMigrate(workspace, timestamp, id, dataRoot) {
       state = createInitialState(workspace.title, timestamp);
     }
   }
+  state = recoverInterruptedEvaluationRuns(state, runtimeId, timestamp);
   if (canonical) await writeCanonicalProjectFile(canonical, state, id);
   if (canonical) await syncProjectMirror(mirror, state, id).catch(() => {});
   else await syncProjectMirror(mirror, state, id);
   await reconcileBriefArtifact(workspace.path, state, id);
   return state;
+}
+
+function recoverInterruptedEvaluationRuns(state, runtimeId, timestamp) {
+  const interruptedIds = state.runs.order.filter((runId) => {
+    const run = state.runs.byId[runId];
+    return run.status === 'running' && run.runtimeInstanceId !== runtimeId;
+  });
+  if (!interruptedIds.length) return state;
+  const byId = { ...state.runs.byId };
+  for (const runId of interruptedIds) {
+    byId[runId] = {
+      ...byId[runId],
+      status: 'failed',
+      conclusion: 'interrupted',
+      completedAt: timestamp,
+      evidence: {
+        summary: '运行时重启前未能确认这次代理运行的结论。',
+        assertions: [],
+        error: { code: 'runtime_restarted', message: '运行时重启，未完成的代理运行已按未通过恢复。' },
+      },
+    };
+  }
+  return {
+    ...state,
+    stateVersion: state.stateVersion + 1,
+    runs: { ...state.runs, byId },
+    updatedAt: timestamp,
+  };
 }
 
 async function ensureManagedArtifacts(workspacePath, id) {
@@ -1345,7 +1376,7 @@ function isEvaluationRunFinish(value) {
     && typeof value.runId === 'string' && value.runId
     && ['passed', 'failed', 'cancelled'].includes(value.status)
     && ((value.status === 'passed' && value.conclusion === 'passed')
-      || (value.status === 'failed' && ['failed', 'timed_out'].includes(value.conclusion))
+      || (value.status === 'failed' && ['failed', 'timed_out', 'interrupted'].includes(value.conclusion))
       || (value.status === 'cancelled' && value.conclusion === 'cancelled'))
     && typeof value.completedAt === 'string' && value.completedAt
     && value.evidence && typeof value.evidence === 'object' && !Array.isArray(value.evidence);
@@ -1361,7 +1392,7 @@ function isEvaluationRun(value) {
     workBriefRevision: value.workBriefRevision,
     retryOf: value.retryOf,
     startedAt: value.startedAt,
-  })) return false;
+  }) || !(value.runtimeInstanceId === undefined || (typeof value.runtimeInstanceId === 'string' && value.runtimeInstanceId))) return false;
   if (value.status === 'running') {
     return value.completedAt === null && value.conclusion === null && value.evidence === null;
   }

@@ -181,7 +181,8 @@ export function apply(ctx) {
   registerApi(ctx, '/api/wanxiang/project', async (request) => {
     if (request.method === 'GET') {
       const workspaceId = queryText(request, 'workspaceId', 200);
-      return [200, projectResponse(await service.getProject(workspaceId))];
+      const snapshot = await service.getProjectEvidence(workspaceId);
+      return [200, projectResponse(snapshot.state, { evaluation: snapshot.evaluation })];
     }
     requireMethod(request, 'PUT');
     const payload = requireObject(await readJson(request));
