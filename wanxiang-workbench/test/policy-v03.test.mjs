@@ -6,10 +6,13 @@ import test from 'node:test';
 import {
   apply,
   createActivationApiHandler,
+  createAutomaticEvaluationHooks,
   createDiscoveryAuthorizationGuard,
+  createEvaluationApiHandler,
   createPublicWebFetchTool,
   createWorkBriefTool,
   discoveryToolAllowed,
+  evaluationPolicy,
   inject,
   renderPromptWorkDescription,
 } from '../src/policy.mjs';
@@ -155,6 +158,108 @@ test('work-description prompt exposes one deterministic next question and respon
   assert.match(prompt, /请上传或指出一份最近实际使用过的材料/u);
   assert.match(prompt, /先更新工作说明，再用 1–2 句复述当前理解/u);
   assert.match(prompt, /只能询问上面的唯一问题/u);
+});
+
+test('making policy requires one automatic full Eval immediately after every Workflow change', () => {
+  assert.match(evaluationPolicy, /After every successful change/u);
+  assert.match(evaluationPolicy, /call wanxiang_run_evaluation once without caseId/u);
+  assert.match(evaluationPolicy, /all protected cases/u);
+  assert.match(evaluationPolicy, /do not wait for another user message/u);
+});
+
+test('successful Workflow mutations through any tool force one full Eval in the same Agent execution', async (t) => {
+  const workspacePath = await mkdtemp(path.join(tmpdir(), 'wanxiang-auto-eval-'));
+  t.after(() => rm(workspacePath, { recursive: true, force: true }));
+  const artifactRoot = path.join(workspacePath, '.wanxiang');
+  await mkdir(artifactRoot, { recursive: true });
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'old source');
+  await writeFile(path.join(artifactRoot, 'workflow.json'), '{}');
+  const agent = { id: 'session-root', session: { header: { cwd: workspacePath } } };
+  const state = { brief: { revision: 4 }, work: { sessionId: agent.id, activeRevision: 4 } };
+  const calls = [];
+  const hooks = createAutomaticEvaluationHooks({
+    projectService: {
+      async contextForAgent(actual) {
+        assert.equal(actual, agent);
+        return { workspaceId: 'workspace-1', workspacePath, state };
+      },
+    },
+    evaluationTool: {
+      async execute(args, execution) {
+        calls.push({ args, execution });
+        return { status: 'passed', summary: '5 个代理案例全部通过' };
+      },
+    },
+  });
+  const accepted = { kind: 'accept' };
+  const execution = {
+    name: 'run_code', agent, signal: new AbortController().signal,
+    arguments: { code: 'arbitrary file mutation' },
+  };
+
+  assert.equal(await hooks.before(execution, async () => accepted), accepted);
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'new source');
+  const decision = await hooks.after(execution, { isError: false }, async () => accepted);
+  assert.equal(decision.kind, 'accept');
+  assert.match(decision.additionalContexts[0].content[0].text, /5 个代理案例全部通过/u);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, {});
+  assert.equal(calls[0].execution, execution);
+
+  const unrelated = { ...execution, arguments: { code: 'write README' } };
+  await hooks.before(unrelated, async () => accepted);
+  await writeFile(path.join(workspacePath, 'README.md'), 'unrelated');
+  await hooks.after(unrelated, { isError: false }, async () => accepted);
+  assert.equal(calls.length, 1);
+
+  const partialFailure = { ...execution, arguments: { code: 'write then exit nonzero' } };
+  await hooks.before(partialFailure, async () => accepted);
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'changed before tool error');
+  await hooks.after(partialFailure, { isError: true }, async () => accepted);
+  assert.equal(calls.length, 2);
+
+  const controller = new AbortController();
+  const cancelledAfterWrite = { ...execution, signal: controller.signal };
+  await hooks.before(cancelledAfterWrite, async () => accepted);
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'changed before cancellation');
+  controller.abort();
+  await hooks.after(cancelledAfterWrite, { isError: true }, async () => accepted);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].execution.signal.aborted, false);
+});
+
+test('automatic Eval infrastructure failures notify the Agent without rewriting a successful file edit', async (t) => {
+  const workspacePath = await mkdtemp(path.join(tmpdir(), 'wanxiang-auto-eval-failure-'));
+  t.after(() => rm(workspacePath, { recursive: true, force: true }));
+  const artifactRoot = path.join(workspacePath, '.wanxiang');
+  await mkdir(artifactRoot, { recursive: true });
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'old source');
+  await writeFile(path.join(artifactRoot, 'workflow.json'), '{}');
+  const agent = { id: 'session-root', session: { header: { cwd: workspacePath } } };
+  const hooks = createAutomaticEvaluationHooks({
+    projectService: {
+      async contextForAgent() {
+        return {
+          workspacePath,
+          state: { brief: { revision: 1 }, work: { sessionId: agent.id, activeRevision: 1 } },
+        };
+      },
+    },
+    evaluationTool: {
+      async execute() { throw Object.assign(new Error('评测服务不可用'), { code: 'evaluation_unavailable' }); },
+    },
+  });
+
+  const execution = {
+    name: 'write', agent, signal: new AbortController().signal,
+    arguments: { file_path: '.wanxiang/workflow.mjs', content: 'source' },
+  };
+  await hooks.before(execution, async () => ({ kind: 'allow' }));
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'new source');
+  const decision = await hooks.after(execution, { isError: false }, async () => ({ kind: 'accept' }));
+
+  assert.equal(decision.kind, 'accept');
+  assert.match(decision.additionalContexts[0].content[0].text, /自动评测未完成.*评测服务不可用/u);
 });
 
 test('work-description tool rejects unknown and empty patches before state mutation', async () => {
@@ -408,6 +513,40 @@ test('activation rejects a cross-workspace session before reserving state', asyn
     briefRevision: 1,
   })), (error) => error.code === 'session_workspace_mismatch');
   assert.equal(reserves, 0);
+});
+
+test('manual rerun API executes the current Eval through the live canonical session', async () => {
+  const { ctx, agent } = activationContext('workspace-write');
+  let execution;
+  const state = activationState('active');
+  const service = {
+    async contextForAgent(actual) {
+      assert.equal(actual, agent);
+      return { workspaceId: 'workspace-1', state };
+    },
+    async getProjectEvidence(workspaceId) {
+      assert.equal(workspaceId, 'workspace-1');
+      return { state, evaluation: { workflowVersion: '2.0.0', evalRevision: 1, cases: [] } };
+    },
+  };
+  const evaluationTool = {
+    async execute(args, value) {
+      execution = { args, value };
+      return { status: 'passed', summary: '5 个代理案例全部通过', results: [{ runId: 'run-1' }] };
+    },
+  };
+  const handler = createEvaluationApiHandler(ctx, service, evaluationTool);
+
+  const [status, body] = await handler(jsonRequest('POST', {
+    workspaceId: 'workspace-1',
+    sessionId: 'session-root',
+  }));
+
+  assert.equal(status, 200);
+  assert.deepEqual(execution.args, {});
+  assert.equal(execution.value.agent, agent);
+  assert.equal(body.evaluationRun.status, 'passed');
+  assert.equal(body.state, state);
 });
 
 function activationState(status) {

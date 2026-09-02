@@ -186,9 +186,13 @@ test('customer follow-up proxy slice runs all five protected cases with stable s
     now: () => '2026-09-02T10:00:00.000Z',
   });
 
+  const firstBatch = await tool.execute({}, { agent, signal: new AbortController().signal });
+  assert.equal(firstBatch.status, 'passed');
+  assert.equal(firstBatch.results.length, 5);
   const firstPass = [];
-  for (const evalCase of evaluation.eval.cases) {
-    const result = await tool.execute({ caseId: evalCase.id }, { agent, signal: new AbortController().signal });
+  for (const [index, evalCase] of evaluation.eval.cases.entries()) {
+    const result = firstBatch.results[index];
+    assert.equal(result.caseId, evalCase.id);
     assert.equal(result.status, 'passed', evalCase.title);
     assert.deepEqual(result.output.missingFollowUps, evalCase.expected.missingFollowUps);
     for (const fragment of Object.values(evalCase.expected.markdown).flat()) {
@@ -197,11 +201,8 @@ test('customer follow-up proxy slice runs all five protected cases with stable s
     firstPass.push(result.output.missingFollowUps);
   }
 
-  const secondPass = [];
-  for (const evalCase of evaluation.eval.cases) {
-    const result = await tool.execute({ caseId: evalCase.id }, { agent, signal: new AbortController().signal });
-    secondPass.push(result.output.missingFollowUps);
-  }
+  const secondBatch = await tool.execute({}, { agent, signal: new AbortController().signal });
+  const secondPass = secondBatch.results.map((result) => result.output.missingFollowUps);
   assert.deepEqual(secondPass, firstPass);
 });
 

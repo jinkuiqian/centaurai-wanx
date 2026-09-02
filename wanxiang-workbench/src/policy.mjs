@@ -1,4 +1,5 @@
-import { realpath } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import {
   BRIEF_FIELDS,
@@ -51,7 +52,7 @@ const makingPolicy = `You are Wanxiang, continuing the same conversation in whic
 The confirmed work description is the current contract. Work in one continuous make-and-verify loop: inspect the real materials, make the smallest useful implementation, run representative and boundary checks immediately, explain failures in plain language, and revise until there is evidence for every acceptance criterion. Code generation alone is not completion.
 
 Keep artifacts readable and versionable inside the current project. Never claim a Data Agent or external system is connected when only a sample contract exists. Preview risky writes and obtain the native approval before any external message, deletion, payment, credential use, or other irreversible side effect. The community drawer is external support, not an approval stage.`;
-const evaluationPolicy = `The editable deterministic implementation is .wanxiang/${WORKFLOW_ENTRYPOINT} with its fixed manifest at .wanxiang/${WORKFLOW_MANIFEST}. This is a proxy vertical slice over synthetic material, not a shadow or real run. After each change, run every case listed in .wanxiang/evals.json separately through wanxiang_run_evaluation so the workbench shows all case statuses and evidence. .wanxiang/evals.json is a read-only mirror of protected representative cases and expected results: never edit it to make the implementation pass.`;
+export const evaluationPolicy = `The editable deterministic implementation is .wanxiang/${WORKFLOW_ENTRYPOINT} with its fixed manifest at .wanxiang/${WORKFLOW_MANIFEST}. This is a proxy vertical slice over synthetic material, not a shadow or real run. After every successful change to the Workflow or its manifest, call wanxiang_run_evaluation once without caseId so all protected cases run immediately; do not wait for another user message. Inspect every case result before making the next change. .wanxiang/evals.json is a read-only mirror of protected representative cases and expected results: never edit it to make the implementation pass.`;
 
 const DISCOVERY_TOOLS = new Set([
   'ask_user_question',
@@ -76,18 +77,25 @@ export function apply(ctx) {
   const runEvidenceStore = new RunEvidenceStore({ dataRoot });
   const runner = new RestrictedWorkflowRunner();
   const authorization = createAuthorizationTracker();
-  void service.prepareRoots().catch(() => {});
-
-  ctx.effect(() => ctx.tools.register(createWorkBriefTool(service)));
-  ctx.effect(() => ctx.sessionProjections.register(createProxyRunProjectionDefinition()));
-  ctx.effect(() => ctx.tools.register(createProxyRunToolAdapter({
+  const evaluationTool = createProxyRunToolAdapter({
     projectService: service,
     evaluationStore,
     runner,
     workflowEngine: ctx.workflowEngine,
     evidenceStore: runEvidenceStore,
     flushSession: (session) => ctx.sessions.flush(session),
-  })));
+  });
+  const automaticEvaluation = createAutomaticEvaluationHooks({
+    projectService: service,
+    evaluationTool,
+  });
+  void service.prepareRoots().catch(() => {});
+
+  ctx.effect(() => ctx.tools.register(createWorkBriefTool(service)));
+  ctx.effect(() => ctx.sessionProjections.register(createProxyRunProjectionDefinition()));
+  ctx.effect(() => ctx.tools.register(evaluationTool));
+  ctx.effect(() => ctx.on('tools/pre-execute', automaticEvaluation.before));
+  ctx.effect(() => ctx.on('tools/post-execute', automaticEvaluation.after));
   if (!ctx.tools.get('web_fetch')) {
     ctx.effect(() => ctx.tools.register(createPublicWebFetchTool(ctx.web)));
   }
@@ -211,6 +219,7 @@ export function apply(ctx) {
   });
 
   registerApi(ctx, '/api/wanxiang/activation', createActivationApiHandler(ctx, service, authorization));
+  registerApi(ctx, '/api/wanxiang/evaluation/rerun', createEvaluationApiHandler(ctx, service, evaluationTool));
 
   // v0.2 clients may still finish an already-reserved operation while upgrading.
   registerApi(ctx, '/api/wanxiang/dispatch', async (request) => {
@@ -352,6 +361,94 @@ export function createActivationApiHandler(ctx, service, authorization = null) {
     });
     return [200, projectResponse(state, { activationId, activation: state.work.activation })];
   };
+}
+
+export function createEvaluationApiHandler(ctx, service, evaluationTool) {
+  return async (request) => {
+    requireMethod(request, 'POST');
+    const payload = requireObject(await readJson(request));
+    rejectUnknownKeys(payload, ['workspaceId', 'sessionId'], '评测重跑参数');
+    const workspaceId = requiredText(payload.workspaceId, '项目 ID', 200);
+    const sessionId = requiredText(payload.sessionId, '会话 ID', 200);
+    const agent = await requireActivationAgent(ctx, service, workspaceId, sessionId, { requireIdle: true });
+    const evaluationRun = await evaluationTool.execute({}, { agent, signal: request.signal });
+    const snapshot = await service.getProjectEvidence(workspaceId);
+    return [200, projectResponse(snapshot.state, { evaluation: snapshot.evaluation, evaluationRun })];
+  };
+}
+
+export function createAutomaticEvaluationHooks({ projectService, evaluationTool }) {
+  const snapshots = new WeakMap();
+  return {
+    before: async (execution, next) => {
+      const decision = await next();
+      if (!execution?.agent || execution.signal?.aborted || decision.kind === 'deny') return decision;
+      try {
+        const context = await projectService.contextForAgent(execution.agent);
+        if (context?.state && context.state.work?.sessionId === String(execution.agent.id)
+          && context.state.work?.activeRevision === context.state.brief?.revision
+          && typeof context.workspacePath === 'string') {
+          snapshots.set(execution, { context, files: await workflowFileSnapshot(context.workspacePath) });
+        }
+      } catch (error) {
+        snapshots.set(execution, { error });
+      }
+      return decision;
+    },
+    after: async (execution, result, next) => {
+      const decision = await next();
+      const before = snapshots.get(execution);
+      snapshots.delete(execution);
+      if (!before) return decision;
+      if (before.error) {
+        return addAutomaticEvaluationNotice(
+          decision,
+          `万象无法确认 Workflow 修改前的版本，因此没有自动评测：${before.error instanceof Error ? before.error.message : '版本读取失败'}。请手动重跑当前修订。`,
+        );
+      }
+      let after;
+      try {
+        after = await workflowFileSnapshot(before.context.workspacePath);
+      } catch (error) {
+        return addAutomaticEvaluationNotice(
+          decision,
+          `Workflow 工具已完成，但万象无法确认修改后的版本：${error instanceof Error ? error.message : '版本读取失败'}。请手动重跑当前修订。`,
+        );
+      }
+      if (JSON.stringify(after) === JSON.stringify(before.files)) return decision;
+      try {
+        const evaluationExecution = execution.signal?.aborted
+          ? { ...execution, signal: new AbortController().signal }
+          : execution;
+        const evaluationRun = await evaluationTool.execute({}, evaluationExecution);
+        return addAutomaticEvaluationNotice(
+          decision,
+          `万象已自动运行当前 Eval：${evaluationRun.summary || evaluationRun.status}。请检查逐案例证据后再继续修改。`,
+        );
+      } catch (error) {
+        return addAutomaticEvaluationNotice(
+          decision,
+          `Workflow 已修改，但自动评测未完成：${error instanceof Error ? error.message : '评测服务暂时不可用'}。请先重跑当前修订再继续修改。`,
+        );
+      }
+    },
+  };
+}
+
+function addAutomaticEvaluationNotice(decision, text) {
+  const notice = {
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'plugin', plugin: name, form: 'notice', summary: 'Workflow 修改后自动评测' },
+  };
+  return { ...decision, additionalContexts: [notice, ...(decision.additionalContexts || [])] };
+}
+
+async function workflowFileSnapshot(workspacePath) {
+  const read = (filename) => readFile(path.join(workspacePath, '.wanxiang', filename), 'utf8')
+    .catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
+  return Promise.all([read(WORKFLOW_ENTRYPOINT), read(WORKFLOW_MANIFEST)]);
 }
 
 export function createWorkBriefTool(service) {

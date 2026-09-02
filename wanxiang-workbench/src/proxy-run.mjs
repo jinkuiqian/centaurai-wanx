@@ -181,9 +181,9 @@ export function createProxyRunToolAdapter({
   createRunId = randomUUID,
   now = () => new Date().toISOString(),
 }) {
-  return {
+  const tool = {
     name: PROXY_RUN_TOOL_NAME,
-    description: 'DSH adapter: run Wanxiang\'s deterministic preset proxy run for the current project in the workflow execution environment.',
+    description: 'DSH adapter: run one case, or every case when caseId is omitted, from Wanxiang\'s current deterministic proxy Eval.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -197,7 +197,6 @@ export function createProxyRunToolAdapter({
           description: 'The completed runId this retry follows, when this attempt is a retry.',
         },
       },
-      required: ['caseId'],
     },
     output: {
       schema: {
@@ -207,7 +206,7 @@ export function createProxyRunToolAdapter({
           runId: { type: 'string' },
           status: { type: 'string' },
         },
-        required: ['runId', 'status'],
+        required: ['status'],
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
       presentationMeta: (_args, value) => ({
@@ -217,8 +216,10 @@ export function createProxyRunToolAdapter({
       }),
     },
     async execute(args, execution) {
-      if (!args || typeof args.caseId !== 'string' || !args.caseId.trim()
+      if (!args || typeof args !== 'object' || Array.isArray(args)
+        || (args.caseId !== undefined && (typeof args.caseId !== 'string' || !args.caseId.trim()))
         || (args.retryOf !== undefined && (typeof args.retryOf !== 'string' || !args.retryOf.trim()))
+        || (args.caseId === undefined && args.retryOf !== undefined)
         || Object.keys(args).some((key) => !['caseId', 'retryOf'].includes(key))) {
         throw proxyRunError('proxy_run_case_invalid', '需要指定当前验收标准中的代表案例。', 400);
       }
@@ -244,6 +245,34 @@ export function createProxyRunToolAdapter({
         workspaceId: context.workspaceId,
         workspacePath: context.workspacePath,
       });
+      if (args.caseId === undefined) {
+        const results = [];
+        for (const currentCase of evaluation.eval.cases) {
+          const previous = [...(context.state.runs?.order || [])].reverse()
+            .map((runId) => context.state.runs?.byId?.[runId])
+            .find((run) => run?.caseId === currentCase.id && run.status !== 'running');
+          try {
+            results.push(await tool.execute({
+              caseId: currentCase.id,
+              ...(previous?.runId ? { retryOf: previous.runId } : {}),
+            }, execution));
+          } catch (error) {
+            if (execution.signal?.aborted || error?.code === 'workflow_cancelled') throw error;
+            if (!error?.evidence) throw error;
+            results.push(error.evidence);
+          }
+        }
+        const passed = results.length > 0 && results.every((result) => result.status === 'passed');
+        return {
+          status: passed ? 'passed' : 'failed',
+          summary: passed
+            ? `${results.length} 个代理案例全部通过`
+            : `${results.filter((result) => result.status === 'passed').length}/${results.length} 个代理案例通过`,
+          workflowVersion: evaluation.workflow.workflowVersion,
+          evalRevision: evaluation.eval.revision,
+          results,
+        };
+      }
       const evalCase = evaluation.eval.cases.find((candidate) => candidate.id === args.caseId);
       if (!evalCase) throw proxyRunError('proxy_run_case_invalid', '当前验收标准不包含这个代表案例。', 400);
       const runId = String(createRunId());
@@ -305,10 +334,16 @@ export function createProxyRunToolAdapter({
           terminal?.conclusion ?? (evidence.status === 'passed' ? 'passed' : 'failed'), result.stopReason,
         );
         if (failure) {
-          throw Object.assign(proxyRunError(failure.code, failure.message, failure.statusCode), { evaluationTerminalCommitted: true });
+          throw Object.assign(proxyRunError(failure.code, failure.message, failure.statusCode), {
+            evaluationTerminalCommitted: true,
+            evidence,
+          });
         }
         if (evidence.status !== 'passed') {
-          throw Object.assign(proxyRunError('proxy_run_assertion_failed', evidence.summary), { evaluationTerminalCommitted: true });
+          throw Object.assign(proxyRunError('proxy_run_assertion_failed', evidence.summary), {
+            evaluationTerminalCommitted: true,
+            evidence,
+          });
         }
         return evidence;
       } catch (error) {
@@ -329,10 +364,14 @@ export function createProxyRunToolAdapter({
           agent.session, evidenceStore, projectService, flushSession, evidence, terminal.conclusion,
           terminal.status === 'cancelled' ? 'cancelled' : 'error',
         );
-        throw Object.assign(error instanceof Error ? error : new Error(failure.message), failure, { evaluationTerminalCommitted: true });
+        throw Object.assign(error instanceof Error ? error : new Error(failure.message), failure, {
+          evaluationTerminalCommitted: true,
+          evidence,
+        });
       }
     },
   };
+  return tool;
 }
 
 function evaluationEvidence({ runId, retryOf, context, sessionId, evaluation, evalCase, startedAt, completedAt, value }) {
@@ -348,6 +387,7 @@ function evaluationEvidence({ runId, retryOf, context, sessionId, evaluation, ev
     status: value.status,
     startedAt,
     completedAt,
+    input: structuredClone(evalCase.input),
     summary: value.summary,
     assertions: value.assertions,
     ...(value.output ? { output: value.output } : {}),
@@ -358,6 +398,7 @@ function evaluationEvidence({ runId, retryOf, context, sessionId, evaluation, ev
 async function recordEvaluationResult(session, evidenceStore, projectService, flushSession, evidence, conclusion, stopReason) {
   await evidenceStore.save(evidence);
   const eventEvidence = {
+    input: evidence.input,
     summary: evidence.summary,
     assertions: evidence.assertions,
     ...(evidence.output ? { output: evidence.output } : {}),

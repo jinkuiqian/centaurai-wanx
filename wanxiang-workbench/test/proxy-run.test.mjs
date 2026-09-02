@@ -273,6 +273,7 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   });
 
   assert.equal(tool.name, PROXY_RUN_TOOL_NAME);
+  assert.deepEqual(tool.output.schema.required, ['status']);
   const output = await tool.execute({ caseId: DEFAULT_PROXY_RUN_CASE_ID }, { agent, signal: new AbortController().signal });
 
   assert.equal(workflowRequest.parent, agent);
@@ -305,6 +306,10 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   assert.equal(saved[0].workflowVersion, '2.0.0');
   assert.equal(saved[0].evalRevision, 3);
   assert.equal(saved[0].workBriefRevision, 7);
+  assert.deepEqual(saved[0].input, {
+    asOf: '2026-09-01', customersCsv: 'customer_id,name', communicationsJson: '[]',
+  });
+  assert.deepEqual(events[1].data.evidence.input, saved[0].input);
   assert.deepEqual(projectRuns.map((item) => [item.phase, item.projectId, item.value.runId]), [
     ['start', 'project-1', 'run-unique-1'],
     ['finish', 'project-1', 'run-unique-1'],
@@ -548,6 +553,7 @@ test('cancelled retries keep a new runId, link the prior attempt and finalize pr
     conclusion: 'cancelled',
     completedAt: '2026-09-02T10:00:01.000Z',
     evidence: {
+      input: {},
       summary: '用户已取消代理运行。',
       assertions: [],
       error: { code: 'workflow_cancelled', message: '用户已取消代理运行。' },
@@ -556,6 +562,47 @@ test('cancelled retries keep a new runId, link the prior attempt and finalize pr
   assert.equal(events[0].data.retryOf, 'run-failed-1');
   assert.equal(events[1].data.status, 'cancelled');
   assert.equal(events[1].data.conclusion, 'cancelled');
+});
+
+test('a cancelled full Eval stops before starting the next case', async () => {
+  const started = [];
+  const agent = { id: 'session-1', session: { header: {}, append() {} } };
+  const tool = createProxyRunToolAdapter({
+    projectService: {
+      async contextForAgent() {
+        return {
+          workspaceId: 'project-1', workspacePath: '/managed/project',
+          state: { brief: { revision: 1 }, work: { sessionId: 'session-1', activeRevision: 1 } },
+        };
+      },
+      async startEvaluationRun(_projectId, run) { started.push(run.caseId); },
+      async finishEvaluationRun() {},
+    },
+    evaluationStore: {
+      async load() {
+        return {
+          workflow: { workflowVersion: '2.0.0', entrypoint: 'workflow.mjs' }, source: 'source',
+          eval: { revision: 1, cases: [
+            { id: 'case-1', input: {}, expected: {} },
+            { id: 'case-2', input: {}, expected: {} },
+          ] },
+        };
+      },
+    },
+    runner: {
+      async run() { throw Object.assign(new Error('用户已取消代理运行。'), { code: 'workflow_cancelled' }); },
+    },
+    workflowEngine: { start() { assert.fail('cancelled execution must not reach assertions'); } },
+    evidenceStore: { async save() {} },
+    flushSession: async () => {},
+    createRunId: () => 'cancelled-batch-run',
+    now: sequenceClock('2026-09-02T10:00:00.000Z', '2026-09-02T10:00:01.000Z'),
+  });
+
+  await assert.rejects(tool.execute({}, { agent, signal: new AbortController().signal }), {
+    code: 'workflow_cancelled',
+  });
+  assert.deepEqual(started, ['case-1']);
 });
 
 test('proxy-run evidence is persisted outside project code under stable run identity', async (t) => {

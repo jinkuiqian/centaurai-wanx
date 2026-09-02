@@ -56,17 +56,29 @@ test('v0.3.4 distinguishes running, pass, partial failure, timeout and cancellat
 });
 
 test('v0.3.5 restores protected workflow, eval and historical run evidence in the existing drawer', () => {
-  assert.match(client, /function RunEvidencePanel\(\{ project \}\)/u);
+  assert.match(client, /function RunEvidencePanel\(\{ project,/u);
   assert.match(client, /project\.evaluation\.workflowVersion/u);
   assert.match(client, /project\.evaluation\.evalRevision/u);
   assert.match(client, /project\.runs\.order/u);
   for (const label of ['Workflow 版本', 'Eval 修订', '逐案例结果', '前次运行', '运行时重启']) {
     assert.match(client, new RegExp(label, 'u'));
   }
-  assert.match(client, /h\(RunEvidencePanel, \{ project \}\)/u);
+  assert.match(client, /h\(RunEvidencePanel, \{/u);
   assert.match(client, /"aria-live": "polite"/u);
   assert.match(client, /wx-run-history[\s\S]*run\.evidence\?\.error\?\.message/u);
+  assert.match(client, /输入快照[\s\S]*JSON\.stringify\(run\.evidence\.input/u);
   assert.match(client, /断言 \$\{passedAssertions\}\/\$\{assertions\.length\}/u);
+});
+
+test('v0.3.6 manually reruns the current Eval from the accessible evidence panel', () => {
+  assert.match(client, /apiJson\("\/api\/wanxiang\/evaluation\/rerun"/u);
+  assert.match(client, /手动重跑当前修订/u);
+  assert.match(client, /本次会按当前 Workflow 版本运行全部代表案例/u);
+  assert.match(client, /function RunEvidencePanel\(\{ project, onRerun, rerunning, canRerun \}\)/u);
+  assert.match(client, /"aria-live": "polite"/u);
+  assert.match(client, /disabled: rerunning \|\| !canRerun/u);
+  assert.match(client, /rootContext\.sessions\.list\.subscribe\(refresh\)/u);
+  assert.match(client, /if \(refreshing \|\| record\.busy\) return/u);
 });
 
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {
