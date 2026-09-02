@@ -181,6 +181,7 @@ function assertStateContract(state, expected) {
     'brief',
     'createdAt',
     'feedback',
+    'improvements',
     'projectName',
     'runs',
     'schemaVersion',
@@ -195,6 +196,7 @@ function assertStateContract(state, expected) {
   assert.equal(typeof state.updatedAt, 'string');
   assert.deepEqual(state.runs, { latestRunId: null, order: [], byId: {} });
   assert.deepEqual(state.feedback, { order: [], byId: {} });
+  assert.deepEqual(state.improvements, { order: [], byId: {} });
   assert.deepEqual(Object.keys(state.brief).sort(), [
     'answers',
     'confirmedAnswers',

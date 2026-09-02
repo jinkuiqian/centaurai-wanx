@@ -85,7 +85,7 @@ test('v0.3.6 manually reruns the current Eval from the accessible evidence panel
 test('v0.3.7 runs a real case, shows reviewable evidence and records three member verdicts', () => {
   assert.match(client, /apiJson\("\/api\/wanxiang\/work-run"/u);
   assert.match(client, /apiJson\("\/api\/wanxiang\/run-feedback"/u);
-  assert.match(client, /function RealWorkPanel\(\{ project, onRun, onFeedback, busy, canRun \}\)/u);
+  assert.match(client, /function RealWorkPanel\(\{ project, onRun, onFeedback,[^}]*busy, canRun \}\)/u);
   for (const copy of ['真实案例名称', '真实工作输入（JSON）', '开始影子运行', '正确', '需要修改', '不可接受']) {
     assert.match(client, new RegExp(copy, 'u'));
   }
@@ -98,6 +98,21 @@ test('v0.3.7 runs a real case, shows reviewable evidence and records three membe
   assert.match(client, /project\.maturity\.stage === "can_try"[\s\S]*可以试用/u);
   assert.match(client, /run && run\.kind !== "real"/u);
   assert.match(client, /h\(RealWorkPanel, \{/u);
+});
+
+test('v0.3.8 turns corrective feedback into a same-session revision loop and keeps contract decisions visible', () => {
+  assert.match(client, /function feedbackChangePrompt\(project, feedbackId\)/u);
+  assert.match(client, /wanxiang_plan_feedback_change/u);
+  assert.match(client, /session\.prompt\(\[\{ type: "text", text: feedbackChangePrompt\(project, feedbackId\) \}\][\s\S]*feedbackId/u);
+  assert.match(client, /apiJson\("\/api\/wanxiang\/feedback-change"/u);
+  assert.match(client, /function normalizeImprovements\(value\)/u);
+  assert.match(client, /project\.improvements\.order/u);
+  for (const copy of ['工作说明变更待确认', '变更前', '变更后', '确认这项变更', '拒绝并沿用当前版本', '原案例重跑']) {
+    assert.match(client, new RegExp(copy, 'u'));
+  }
+  assert.match(client, /improvement\.before\.agentVersion[\s\S]*improvement\.after\?\.agentVersion/u);
+  assert.match(client, /improvement\.sourceRunId[\s\S]*improvement\.rerunId/u);
+  assert.match(client, /feedback\.verdict !== "correct"[\s\S]*继续处理这条反馈/u);
 });
 
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {

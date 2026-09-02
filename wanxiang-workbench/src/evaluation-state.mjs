@@ -14,6 +14,7 @@ export const WORKFLOW_MANIFEST = 'workflow.json';
 export const WORKFLOW_ENTRYPOINT = 'workflow.mjs';
 export const AGENT_MANIFEST = 'agent.json';
 export const DATA_CONTRACT = 'data-contract.json';
+export const AGENT_VERSION_HISTORY = 'agent-versions.json';
 export const WORKFLOW_INPUT_INTERFACE = 'wanxiang.proxy-input/v1';
 export const WORKFLOW_OUTPUT_INTERFACE = 'wanxiang.proxy-output/v1';
 const AGENT_CONTRACT_FIELDS = ['goal', 'inputs', 'examples', 'rules', 'output', 'boundaries', 'success'];
@@ -203,12 +204,13 @@ export class EvaluationProjectStore {
 
   async load(project) {
     const paths = await this.#ensure(project);
-    const [workflowValue, source, evalState, agentValue, dataContractValue] = await Promise.all([
+    const [workflowValue, source, evalState, agentValue, dataContractValue, historyValue] = await Promise.all([
       readJson(paths.workflow, 'workflow_manifest_invalid', 'Workflow 清单格式无效。'),
       readFile(paths.entrypoint, 'utf8'),
       readJson(paths.canonical, 'eval_state_corrupt', '受保护的验收数据已损坏。'),
       readOptionalJson(paths.agent, 'agent_manifest_invalid', '工作 Agent 清单格式无效。'),
       readOptionalJson(paths.dataContract, 'data_contract_invalid', '数据契约格式无效。'),
+      readJson(paths.historyCanonical, 'agent_history_corrupt', '工作 Agent 版本档案已损坏。'),
     ]);
     const workflow = validateWorkflow(workflowValue);
     if (Buffer.byteLength(source) > 64 * 1024) {
@@ -220,6 +222,19 @@ export class EvaluationProjectStore {
       (candidate) => candidate.revision === validatedEvalState.currentRevision && candidate.status === 'confirmed',
     );
     const generated = validateGeneratedArtifacts(agentValue, dataContractValue, workflow, evalRevision);
+    let history = validateAgentHistory(historyValue);
+    if (generated) {
+      const nextHistory = appendAgentVersion(history, agentVersionSnapshot({
+        agent: generated.agent,
+        dataContract: generated.dataContract,
+        workflow,
+        evaluation: evalRevision,
+        source,
+      }));
+      if (nextHistory.versions.length !== history.versions.length) await this.#saveHistory(project, nextHistory);
+      history = nextHistory;
+    }
+    await atomicWrite(paths.historyMirror, `${JSON.stringify(history, null, 2)}\n`, this.createPendingId);
     return {
       workflow,
       source,
@@ -227,6 +242,7 @@ export class EvaluationProjectStore {
       evalState: structuredClone(validatedEvalState),
       agent: generated?.agent ?? null,
       dataContract: generated?.dataContract ?? null,
+      versions: structuredClone(history.versions),
       workspacePath: paths.workspacePath,
     };
   }
@@ -285,6 +301,7 @@ export class EvaluationProjectStore {
         workflow: WORKFLOW_MANIFEST,
         entrypoint: WORKFLOW_ENTRYPOINT,
         evaluations: 'evals.json',
+        versions: AGENT_VERSION_HISTORY,
       },
     };
     const evalState = validateEvalState({
@@ -300,21 +317,28 @@ export class EvaluationProjectStore {
     ]);
     await this.#saveState(project, evalState);
     await atomicWrite(paths.agent, `${JSON.stringify(agent, null, 2)}\n`, this.createPendingId);
+    const history = appendAgentVersion({ schemaVersion: 1, versions: current.versions }, agentVersionSnapshot({
+      agent, dataContract, workflow, evaluation, source: definition.workflowSource,
+    }));
+    await this.#saveHistory(project, history);
     return {
       agent: structuredClone(agent),
       dataContract: structuredClone(dataContract),
       workflow: structuredClone(workflow),
       eval: structuredClone(evaluation),
+      versions: structuredClone(history.versions),
     };
   }
 
   async reviseGeneratedAgent(project) {
     const paths = await this.#ensure(project);
-    const [agentValue, dataContractValue, workflowValue, evalStateValue] = await Promise.all([
+    const [agentValue, dataContractValue, workflowValue, evalStateValue, source, historyValue] = await Promise.all([
       readOptionalJson(paths.agent, 'agent_manifest_invalid', '工作 Agent 清单格式无效。'),
       readOptionalJson(paths.dataContract, 'data_contract_invalid', '数据契约格式无效。'),
       readJson(paths.workflow, 'workflow_manifest_invalid', 'Workflow 清单格式无效。'),
       readJson(paths.canonical, 'eval_state_corrupt', '受保护的验收数据已损坏。'),
+      readFile(paths.entrypoint, 'utf8'),
+      readJson(paths.historyCanonical, 'agent_history_corrupt', '工作 Agent 版本档案已损坏。'),
     ]);
     if (agentValue === null) return null;
     const workflow = validateWorkflow(workflowValue);
@@ -341,11 +365,20 @@ export class EvaluationProjectStore {
     ]);
     await this.#saveState(project, nextEvalState);
     await atomicWrite(paths.agent, `${JSON.stringify(nextAgent, null, 2)}\n`, this.createPendingId);
+    const history = appendAgentVersion(validateAgentHistory(historyValue), agentVersionSnapshot({
+      agent: nextAgent,
+      dataContract: nextDataContract,
+      workflow: nextWorkflow,
+      evaluation: nextEvaluation,
+      source,
+    }));
+    await this.#saveHistory(project, history);
     return {
       agent: structuredClone(nextAgent),
       dataContract: structuredClone(nextDataContract),
       workflow: structuredClone(nextWorkflow),
       eval: structuredClone(nextEvaluation),
+      versions: structuredClone(history.versions),
     };
   }
 
@@ -388,14 +421,27 @@ export class EvaluationProjectStore {
     await atomicWrite(paths.mirror, `${JSON.stringify(validated, null, 2)}\n`, this.createPendingId);
   }
 
+  async #saveHistory(project, history) {
+    const paths = evaluationPaths(this.dataRoot, project);
+    const validated = validateAgentHistory(history);
+    const rendered = `${JSON.stringify(validated, null, 2)}\n`;
+    await atomicWrite(paths.historyCanonical, rendered, this.createPendingId);
+    await atomicWrite(paths.historyMirror, rendered, this.createPendingId);
+  }
+
   async #ensure(project) {
     const paths = evaluationPaths(this.dataRoot, project);
-    await Promise.all([mkdir(path.dirname(paths.workflow), { recursive: true }), mkdir(path.dirname(paths.canonical), { recursive: true })]);
+    await Promise.all([
+      mkdir(path.dirname(paths.workflow), { recursive: true }),
+      mkdir(path.dirname(paths.canonical), { recursive: true }),
+      mkdir(path.dirname(paths.historyCanonical), { recursive: true }),
+    ]);
     const artifactRoot = await validateArtifactRoot(paths.workspacePath, path.dirname(paths.workflow));
     await Promise.all([
       writeIfMissing(paths.workflow, `${JSON.stringify(DEFAULT_WORKFLOW, null, 2)}\n`),
       writeIfMissing(paths.entrypoint, DEFAULT_WORKFLOW_SOURCE),
       writeIfMissing(paths.canonical, `${JSON.stringify(DEFAULT_EVAL_STATE, null, 2)}\n`),
+      writeIfMissing(paths.historyCanonical, `${JSON.stringify({ schemaVersion: 1, versions: [] }, null, 2)}\n`),
     ]);
     await Promise.all([
       validateArtifactFile(artifactRoot, paths.workflow),
@@ -477,6 +523,8 @@ function evaluationPaths(dataRoot, project) {
     entrypoint: path.join(artifactRoot, WORKFLOW_ENTRYPOINT),
     mirror: path.join(artifactRoot, 'evals.json'),
     canonical: path.join(dataRoot, 'evaluations', `${digest(project.workspaceId)}.json`),
+    historyCanonical: path.join(dataRoot, 'agent-versions', `${digest(project.workspaceId)}.json`),
+    historyMirror: path.join(artifactRoot, AGENT_VERSION_HISTORY),
   };
 }
 
@@ -613,6 +661,53 @@ function validateGeneratedArtifacts(agentValue, dataContractValue, workflow, eva
     throw evaluationError('agent_artifacts_inconsistent', '工作 Agent 工件的版本追溯关系无效。', 500);
   }
   return { agent: structuredClone(agentValue), dataContract: structuredClone(dataContractValue) };
+}
+
+function agentVersionSnapshot({ agent, dataContract, workflow, evaluation, source }) {
+  return {
+    agentVersion: agent.agentVersion,
+    workflowVersion: workflow.workflowVersion,
+    workBriefRevision: agent.workBriefRevision,
+    evalRevision: evaluation.revision,
+    source,
+    agent: structuredClone(agent),
+    dataContract: structuredClone(dataContract),
+    workflow: structuredClone(workflow),
+    evaluation: structuredClone(evaluation),
+  };
+}
+
+function appendAgentVersion(history, version) {
+  const existing = history.versions.find((item) => item.agentVersion === version.agentVersion);
+  if (existing) {
+    if (JSON.stringify(existing) !== JSON.stringify(version)) {
+      throw evaluationError('agent_history_version_conflict', '工作 Agent 历史版本不能被改写。', 409);
+    }
+    return history;
+  }
+  return validateAgentHistory({
+    schemaVersion: 1,
+    versions: [...history.versions, version],
+  });
+}
+
+function validateAgentHistory(value) {
+  if (!isPlainObject(value) || value.schemaVersion !== 1 || !Array.isArray(value.versions)
+    || value.versions.some((item) => !isPlainObject(item)
+      || typeof item.agentVersion !== 'string' || !/^\d+\.\d+\.\d+$/u.test(item.agentVersion)
+      || typeof item.workflowVersion !== 'string' || item.workflowVersion !== item.agentVersion
+      || !Number.isSafeInteger(item.workBriefRevision) || item.workBriefRevision < 0
+      || !Number.isSafeInteger(item.evalRevision) || item.evalRevision < 1
+      || typeof item.source !== 'string' || !item.source
+      || !isPlainObject(item.agent) || !isPlainObject(item.dataContract)
+      || !isPlainObject(item.workflow) || !isPlainObject(item.evaluation))) {
+    throw evaluationError('agent_history_corrupt', '工作 Agent 版本档案已损坏。', 500);
+  }
+  const versions = value.versions.map((item) => structuredClone(item));
+  if (new Set(versions.map((item) => item.agentVersion)).size !== versions.length) {
+    throw evaluationError('agent_history_corrupt', '工作 Agent 历史版本号不能重复。', 500);
+  }
+  return { schemaVersion: 1, versions };
 }
 
 function validCapabilities(value) {

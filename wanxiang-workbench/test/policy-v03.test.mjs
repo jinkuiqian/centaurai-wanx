@@ -10,6 +10,8 @@ import {
   createDiscoveryAuthorizationGuard,
   createEvaluationApiHandler,
   createRealWorkRunApiHandler,
+  createRunFeedbackChangeDecisionApiHandler,
+  createRunFeedbackChangeTool,
   createRunFeedbackApiHandler,
   createProjectResponse,
   createPublicWebFetchTool,
@@ -523,6 +525,109 @@ test('automatic Eval infrastructure failures notify the Agent without rewriting 
 
   assert.equal(decision.kind, 'accept');
   assert.match(decision.additionalContexts[0].content[0].text, /自动评测未完成.*评测服务不可用/u);
+});
+
+test('planned implementation feedback automatically bumps the Agent, runs protected Eval and retries the source case', async (t) => {
+  const workspacePath = await mkdtemp(path.join(tmpdir(), 'wanxiang-feedback-loop-'));
+  t.after(() => rm(workspacePath, { recursive: true, force: true }));
+  const artifactRoot = path.join(workspacePath, '.wanxiang');
+  await mkdir(artifactRoot, { recursive: true });
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'old source');
+  await writeFile(path.join(artifactRoot, 'workflow.json'), '{}');
+  await writeFile(path.join(artifactRoot, 'agent.json'), '{"agentVersion":"1.0.0"}');
+  const improvement = {
+    id: 'improvement-1', feedbackId: 'feedback-1', status: 'planned', kind: 'implementation',
+    before: { agentVersion: '1.0.0', workBriefRevision: 4, evalRevision: 2 },
+  };
+  const state = {
+    brief: { revision: 4 }, work: { sessionId: 'session-root', activeRevision: 4 },
+    improvements: { order: ['improvement-1'], byId: { 'improvement-1': improvement } },
+  };
+  const agent = { id: 'session-root', session: { header: { cwd: workspacePath } } };
+  const completed = [];
+  const hooks = createAutomaticEvaluationHooks({
+    projectService: {
+      async contextForAgent() { return { workspaceId: 'workspace-1', workspacePath, state }; },
+      async completeRunFeedbackChange(workspaceId, input) { completed.push({ workspaceId, input }); },
+      async failRunFeedbackChange() { assert.fail('successful feedback loop must not be failed'); },
+    },
+    evaluationStore: {
+      async reviseGeneratedAgent() {
+        return { agent: { agentVersion: '1.0.1' }, eval: { revision: 2 } };
+      },
+    },
+    evaluationTool: { async execute() { return { status: 'passed', summary: '受保护评测通过' }; } },
+    workRun: {
+      async retryFeedback(feedbackId, execution) {
+        assert.equal(feedbackId, 'feedback-1');
+        assert.equal(execution.agent, agent);
+        return { runId: 'run-after', status: 'passed' };
+      },
+    },
+  });
+  const execution = { name: 'write', agent, signal: new AbortController().signal };
+
+  await hooks.before(execution, async () => ({ kind: 'allow' }));
+  await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'new source');
+  const decision = await hooks.after(execution, { isError: false }, async () => ({ kind: 'accept' }));
+
+  assert.deepEqual(completed, [{
+    workspaceId: 'workspace-1',
+    input: { improvementId: 'improvement-1', afterAgentVersion: '1.0.1', rerunId: 'run-after', evalRevision: 2 },
+  }]);
+  assert.match(decision.additionalContexts[0].content[0].text, /原真实案例已自动重跑/u);
+});
+
+test('feedback change tool separates implementation fixes from contract proposals and decisions stay explicit', async () => {
+  const state = { stateVersion: 8, work: { sessionId: 'session-root' } };
+  const agent = { id: 'session-root' };
+  const planned = [];
+  const service = {
+    async contextForAgent(actual) {
+      assert.equal(actual, agent);
+      return { workspaceId: 'workspace-1', state };
+    },
+    async planRunFeedbackChange(workspaceId, baseVersion, input, sessionId) {
+      planned.push({ workspaceId, baseVersion, input, sessionId });
+      return {
+        ...state,
+        improvements: {
+          order: ['improvement-1'],
+          byId: { 'improvement-1': { id: 'improvement-1', feedbackId: input.feedbackId, kind: input.kind, status: input.kind === 'contract' ? 'awaiting_confirmation' : 'planned', diff: [] } },
+        },
+      };
+    },
+  };
+  const tool = createRunFeedbackChangeTool(service);
+  const result = await tool.execute({
+    baseStateVersion: 8, feedbackId: 'feedback-1', kind: 'implementation',
+  }, { agent });
+
+  assert.equal(result.improvementId, 'improvement-1');
+  assert.equal(result.status, 'planned');
+  assert.deepEqual(planned[0], {
+    workspaceId: 'workspace-1', baseVersion: 8,
+    input: { feedbackId: 'feedback-1', kind: 'implementation' }, sessionId: 'session-root',
+  });
+
+  let decision;
+  const handler = createRunFeedbackChangeDecisionApiHandler(activationContext('workspace-write').ctx, {
+    async decideRunFeedbackChange(workspaceId, baseVersion, input, sessionId) {
+      decision = { workspaceId, baseVersion, input, sessionId };
+      return createInitialState('项目');
+    },
+    async getProjectEvidence() { return { evaluation: null }; },
+    async contextForAgent() { return { workspaceId: 'workspace-1', state: activationState('active') }; },
+  });
+  const [status] = await handler(jsonRequest('POST', {
+    workspaceId: 'workspace-1', sessionId: 'session-root', baseVersion: 8,
+    improvementId: 'improvement-1', decision: 'reject',
+  }));
+  assert.equal(status, 200);
+  assert.deepEqual(decision, {
+    workspaceId: 'workspace-1', baseVersion: 8,
+    input: { improvementId: 'improvement-1', decision: 'reject' }, sessionId: 'session-root',
+  });
 });
 
 test('work-description tool rejects unknown and empty patches before state mutation', async () => {

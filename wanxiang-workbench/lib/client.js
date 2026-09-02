@@ -169,6 +169,13 @@ window.__ModuleLoader__.load({
       const order = Array.isArray(source.order) ? source.order.filter((feedbackId) => typeof feedbackId === "string" && rawById[feedbackId]) : [];
       return { order, byId: Object.fromEntries(order.map((feedbackId) => [feedbackId, rawById[feedbackId]])) };
     }
+    function normalizeImprovements(value) {
+      const source = value && typeof value === "object" ? value : {};
+      const rawById = source.byId && typeof source.byId === "object" ? source.byId : {};
+      const order = Array.isArray(source.order)
+        ? source.order.filter((improvementId) => typeof improvementId === "string" && rawById[improvementId]) : [];
+      return { order, byId: Object.fromEntries(order.map((improvementId) => [improvementId, rawById[improvementId]])) };
+    }
     function emptyProject(workspaceId) {
       const answers = Object.fromEntries(fields.map(({ key }) => [key, ""]));
       const fieldSources = Object.fromEntries(fields.map(({ key }) => [key, { status: "unresolved", sourceMessageIds: [] }]));
@@ -187,6 +194,7 @@ window.__ModuleLoader__.load({
         evaluation: normalizeEvaluation(null),
         runs: normalizeRuns(null),
         feedback: normalizeFeedback(null),
+        improvements: normalizeImprovements(null),
         maturity: { stage: "understanding", acceptedRealRunCount: 0 },
       };
       return { ...project, ...deriveProjection(project) };
@@ -241,6 +249,7 @@ window.__ModuleLoader__.load({
         evaluation: normalizeEvaluation(value?.evaluation || source.evaluation || records.get(workspaceId)?.project?.evaluation),
         runs: normalizeRuns(source.runs),
         feedback: normalizeFeedback(source.feedback),
+        improvements: normalizeImprovements(source.improvements),
       };
       const derived = authoritativeGuidance ? null : deriveProjection(project);
       const hostPhase = ["understanding", "ready", "making", "changed", "failed"].includes(projection?.phase)
@@ -443,6 +452,56 @@ window.__ModuleLoader__.load({
         const body = await apiJson("/api/wanxiang/run-feedback", {
           method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ workspaceId, sessionId, baseVersion: record.project.baseVersion, runId, verdict, note }),
+        });
+        assertGeneration();
+        const project = normalizeProject(body, workspaceId);
+        replaceRecord(workspaceId, {
+          status: "ready", busy: verdict !== "correct", project, error: "", errorCode: "", conflict: false,
+        });
+        broadcast(workspaceId);
+        if (verdict !== "correct") {
+          try {
+            await queueFeedbackChange(workspaceId, sessionId, body.feedbackId, project);
+            replaceRecord(workspaceId, { busy: false });
+          } catch (error) {
+            replaceRecord(workspaceId, {
+              busy: false,
+              error: `反馈已保存，但自动修改尚未开始：${error.message}`,
+              errorCode: error.code || "feedback_change_not_started",
+            });
+          }
+        }
+      } catch (error) {
+        if (error.status === 409) await loadProject(workspaceId, true);
+        replaceRecord(workspaceId, { busy: false, error: error.message, errorCode: error.code });
+        throw error;
+      }
+    }
+
+    function feedbackChangePrompt(project, feedbackId) {
+      const feedback = project.feedback.byId[feedbackId];
+      const run = project.runs.byId[feedback?.runId];
+      return `处理已保存的真实案例反馈 ${feedbackId}。\n\n反馈：${feedback?.note || feedback?.verdict || "需要修改"}\n原运行：${run?.runId || feedback?.runId || "未知"}，Agent v${feedback?.agentVersion || run?.agentVersion || "未知"}。\n\n先调用 wanxiang_plan_feedback_change（baseStateVersion=${project.baseVersion}）。如果只需在当前已确认工作说明内修正实现，kind 使用 implementation，然后修改 Workflow；Host 会锁定当前 Eval、自动回归并用原输入重跑。如果会改变目标、输入输出、权限、边界或成功标准，kind 使用 contract 并提交 contractPatch；此时不要修改实现，等待成员在工作说明中确认差异。不得为了通过而放宽 Eval。`;
+    }
+
+    async function queueFeedbackChange(workspaceId, sessionId, feedbackId, project = recordFor(workspaceId).project) {
+      if (!feedbackId) throw Object.assign(new Error("没有找到刚保存的反馈编号。"), { code: "feedback_id_missing" });
+      const session = rootContext.sessions.binding(sessionId)?.session;
+      if (!session) throw Object.assign(new Error("当前制作会话尚未就绪。"), { code: "session_not_live" });
+      const sent = await session.prompt([{ type: "text", text: feedbackChangePrompt(project, feedbackId) }], "queue", undefined, feedbackId);
+      if (!sent.ok) throw Object.assign(new Error(sent.error?.message || "反馈处理指令发送失败。"), { code: sent.error?.code });
+      rootContext.sessions.open(sessionId);
+    }
+
+    async function decideFeedbackChange(workspaceId, sessionId, improvementId, decision) {
+      const record = recordFor(workspaceId);
+      replaceRecord(workspaceId, { busy: true, error: "", errorCode: "" });
+      try {
+        const body = await apiJson("/api/wanxiang/feedback-change", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            workspaceId, sessionId, baseVersion: record.project.baseVersion, improvementId, decision,
+          }),
         });
         assertGeneration();
         replaceRecord(workspaceId, {
@@ -779,7 +838,38 @@ window.__ModuleLoader__.load({
       };
       return labels[guidance?.next?.kind] || "继续补充工作说明";
     }
-    function RealRunCard({ run, feedback, onFeedback, busy }) {
+    function FeedbackImprovementCard({ improvement, onDecision, onResume, busy }) {
+      const statusLabels = {
+        planned: "正在依据反馈修改并回归",
+        awaiting_confirmation: "工作说明变更待确认",
+        accepted: "已接受，等待同步新版工作说明",
+        rejected: "已拒绝，沿用当前版本",
+        completed: "实现修改与原案例重跑已完成",
+        failed: "修改或重跑未完成",
+      };
+      return h("article", { className: "wx-feedback-change", "data-status": improvement.status },
+        h("header", null, h("strong", null, statusLabels[improvement.status] || "反馈改进"),
+          h("small", null, improvement.id)),
+        improvement.kind === "contract" && Array.isArray(improvement.diff) ? h("div", { className: "wx-contract-diff" },
+          improvement.diff.map((item) => h("section", { key: item.field },
+            h("h5", null, item.label || item.field),
+            h("dl", null,
+              h("div", null, h("dt", null, "变更前"), h("dd", null, item.before || "未填写")),
+              h("div", null, h("dt", null, "变更后"), h("dd", null, item.after || "未填写")))))) : null,
+        improvement.before ? h("p", null,
+          `Agent v${improvement.before.agentVersion}`,
+          improvement.after?.agentVersion ? ` → v${improvement.after.agentVersion}` : "",
+          ` · 原运行 ${improvement.sourceRunId}`,
+          improvement.rerunId ? ` · 原案例重跑 ${improvement.rerunId}` : "") : null,
+        improvement.error?.message ? h("p", { role: "alert" }, improvement.error.message) : null,
+        improvement.nextAction ? h("small", null, improvement.nextAction) : null,
+        improvement.status === "awaiting_confirmation" ? h("div", { className: "wx-contract-actions", role: "group", "aria-label": "决定工作说明变更" },
+          h("button", { type: "button", disabled: busy, onClick: () => void onDecision(improvement.id, "accept") }, "确认这项变更"),
+          h("button", { type: "button", disabled: busy, onClick: () => void onDecision(improvement.id, "reject") }, "拒绝并沿用当前版本")) : null,
+        ["planned", "failed"].includes(improvement.status)
+          ? h("button", { type: "button", className: "wx-resume-feedback", disabled: busy, onClick: () => void onResume(improvement.feedbackId) }, "继续处理这条反馈") : null);
+    }
+    function RealRunCard({ run, feedback, improvements, onFeedback, onResume, busy }) {
       const [note, setNote] = React.useState("");
       const [error, setError] = React.useState("");
       const executionSteps = Array.isArray(run.evidence?.steps) ? run.evidence.steps : [];
@@ -798,9 +888,11 @@ window.__ModuleLoader__.load({
         keySteps.length ? h("details", null, h("summary", null, "关键步骤"), h("ol", null, keySteps.map((step) => h("li", { key: step.id }, h("span", null, step.label), step.status ? h("b", null, step.status === "completed" ? "完成" : step.status === "failed" ? "失败" : "跳过") : null)))) : null,
         executionSteps.length ? h("details", null, h("summary", null, "运行事实"), h("ol", null, executionSteps.map((step) => h("li", { key: step.id }, h("span", null, step.label), step.facts ? h("pre", null, JSON.stringify(step.facts, null, 2)) : null)))) : null,
         run.evidence?.error?.message ? h("p", { role: "alert" }, run.evidence.error.message) : null,
-        feedback.length ? h("ul", { className: "wx-member-feedback", "aria-label": "成员反馈历史" }, feedback.map((item) => h("li", { key: item.id },
-          h("b", null, { correct: "正确", needs_changes: "需要修改", unacceptable: "不可接受" }[item.verdict]),
-          item.note ? h("span", null, item.note) : null))) : null,
+        feedback.length ? h("ul", { className: "wx-member-feedback", "aria-label": "成员反馈历史" }, feedback.map((feedback) => h("li", { key: feedback.id },
+          h("b", null, { correct: "正确", needs_changes: "需要修改", unacceptable: "不可接受" }[feedback.verdict]),
+          feedback.note ? h("span", null, feedback.note) : null,
+          feedback.verdict !== "correct" && !improvements.some((item) => item.feedbackId === feedback.id && item.status !== "failed")
+            ? h("button", { type: "button", disabled: busy, onClick: () => void onResume(feedback.id) }, "继续处理这条反馈") : null))) : null,
         run.status !== "running" ? h("div", { className: "wx-feedback-form" },
           h("label", null, "补充说明", h("textarea", { value: note, disabled: busy, rows: 2, onChange: (event) => setNote(event.target.value), placeholder: "指出判断依据、缺失内容或需要修改的地方…" })),
           h("div", { role: "group", "aria-label": "评价这次真实案例" }, [
@@ -808,12 +900,13 @@ window.__ModuleLoader__.load({
           ].map(([verdict, label]) => h("button", { key: verdict, type: "button", disabled: busy, onClick: () => void submit(verdict) }, label))),
           error ? h("p", { role: "alert" }, error) : null) : null);
     }
-    function RealWorkPanel({ project, onRun, onFeedback, busy, canRun }) {
+    function RealWorkPanel({ project, onRun, onFeedback, onResume, onDecision, busy, canRun }) {
       const [caseTitle, setCaseTitle] = React.useState("");
       const [inputText, setInputText] = React.useState("{}");
       const [error, setError] = React.useState("");
       const realRuns = project.runs.order.map((runId) => project.runs.byId[runId]).filter((run) => run?.kind === "real").reverse();
       const feedback = project.feedback.order.map((feedbackId) => project.feedback.byId[feedbackId]).filter(Boolean);
+      const improvements = project.improvements.order.map((improvementId) => project.improvements.byId[improvementId]).filter(Boolean).reverse();
       const run = async () => {
         setError("");
         let input;
@@ -836,10 +929,14 @@ window.__ModuleLoader__.load({
         h("button", { type: "button", className: "wx-primary", disabled: busy || !canRun || !caseTitle.trim() || !inputText.trim(), onClick: () => void run() }, busy ? "正在运行…" : "开始影子运行"),
         !canRun ? h("small", null, "请先在主会话生成当前版本的工作 Agent。") : null,
         error ? h("p", { role: "alert" }, error) : null,
+        improvements.length ? h("div", { className: "wx-feedback-changes", "aria-live": "polite" }, improvements.map((improvement) => h(FeedbackImprovementCard, {
+          key: improvement.id, improvement, busy, onDecision, onResume,
+        }))) : null,
         realRuns.length ? h("div", { className: "wx-real-results", "aria-live": "polite" }, realRuns.map((item) => h(RealRunCard, {
           key: item.runId, run: item, busy,
           feedback: feedback.filter((entry) => entry.runId === item.runId),
-          onFeedback,
+          improvements,
+          onFeedback, onResume,
         }))) : null);
     }
     function RunEvidencePanel({ project, onRerun, rerunning, canRerun }) {
@@ -954,6 +1051,8 @@ window.__ModuleLoader__.load({
           project, busy: record.busy, canRun: canRunRealWork,
           onRun: (caseTitle, input) => runRealWork(workspaceId, sessionId, caseTitle, input),
           onFeedback: (runId, verdict, note) => submitRunFeedback(workspaceId, sessionId, runId, verdict, note),
+          onResume: (feedbackId) => queueFeedbackChange(workspaceId, sessionId, feedbackId),
+          onDecision: (improvementId, decision) => decideFeedbackChange(workspaceId, sessionId, improvementId, decision),
         }),
         h(RunEvidencePanel, {
           project, onRerun: () => void rerunEvaluation(workspaceId, sessionId), rerunning: record.busy, canRerun,
@@ -1312,7 +1411,7 @@ window.__ModuleLoader__.load({
         .wx-badge{display:inline-flex;align-items:center;gap:7px;min-height:30px;padding:5px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:500 12px/18px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer;transition:background-color .14s ease,border-color .14s ease}.wx-badge:hover{background:var(--dsw-alias-interactive-bg-hover)}.wx-badge[data-tone=active]{border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 42%,var(--dsw-alias-border-l2));color:var(--dsw-alias-state-business-primary)}.wx-badge[data-tone=attention]{color:var(--dsw-alias-state-warn-primary)}.wx-badge[data-tone=problem]{color:var(--dsw-alias-state-error-primary)}
         .wx-backdrop{pointer-events:auto;position:fixed;inset:0;border:0;background:rgba(14,20,18,.34);backdrop-filter:blur(2px);animation:wx-fade-in .16s ease both}.wx-drawer{pointer-events:auto;box-sizing:border-box;position:fixed;z-index:2;inset:0 0 0 auto;width:min(420px,calc(100vw - 24px));padding:26px 24px 36px;overflow:auto;overscroll-behavior:contain;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-left:1px solid var(--dsw-alias-border-l2);box-shadow:-20px 0 56px rgba(13,24,20,.18);font-family:var(--ds-font-family-text,ui-sans-serif,system-ui);animation:wx-drawer-in .16s ease-out both;outline:none}.wx-drawer :is(button,input,textarea):focus-visible,.wx-guidance button:focus-visible,.wx-side:focus-visible,.wx-badge:focus-visible,.wx-model-inline button:focus-visible,.wx-tool-brief button:focus-visible,.wx-rerun:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:2px}.wx-close{position:absolute;top:16px;right:16px;width:36px;height:36px;display:grid;place-items:center;border:0;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}.wx-close:hover{background:var(--dsw-alias-interactive-bg-hover)}
         .wx-panel-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-right:40px;margin-bottom:18px}.wx-panel-head p,.wx-community-head p{margin:0 0 4px;color:var(--dsw-alias-state-business-primary);font:650 10px/15px var(--ds-font-family-code,ui-monospace,monospace);letter-spacing:.12em;text-transform:uppercase}.wx-panel-head h2,.wx-community-head h2{margin:0;font:560 28px/1.25 ui-serif,"Songti SC","STSong",serif}.wx-panel-status{flex:none;margin-top:4px;padding:4px 8px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:11px}.wx-panel-status[data-tone=active]{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent);color:var(--dsw-alias-state-business-primary)}.wx-panel-status[data-tone=problem]{color:var(--dsw-alias-state-error-primary)}.wx-project-name{display:block;margin-bottom:14px;color:var(--dsw-alias-label-tertiary);font-size:11px}.wx-project-name input{box-sizing:border-box;width:100%;height:38px;margin-top:6px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:500 13px/20px var(--ds-font-family-text,ui-sans-serif,system-ui);outline:none}.wx-project-name input:focus,.wx-brief-field textarea:focus,.wx-community-input:focus{border-color:var(--dsw-alias-state-business-primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-state-business-primary) 12%,transparent)}
-        .wx-real-work{margin:0 0 18px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 4%,var(--dsw-alias-bg-base))}.wx-real-work-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.wx-real-work h3{margin:0;font:600 14px/1.4 ui-serif,"Songti SC","STSong",serif}.wx-real-work-head span{padding:3px 7px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent);color:var(--dsw-alias-state-success-primary);font-size:10px}.wx-real-work>p{margin:7px 0;color:var(--dsw-alias-label-secondary);font-size:10px;line-height:1.5}.wx-real-work>label,.wx-feedback-form>label{display:block;margin-top:9px;color:var(--dsw-alias-label-tertiary);font-size:10px}.wx-real-work input,.wx-real-work textarea{box-sizing:border-box;width:100%;margin-top:5px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:11px/1.5 var(--ds-font-family-code,ui-monospace,monospace);resize:vertical}.wx-real-work>.wx-primary{width:100%;min-height:36px;margin-top:9px}.wx-real-work>small{display:block;margin-top:6px;color:var(--dsw-alias-label-caption);font-size:9px}.wx-real-results{display:grid;gap:8px;margin-top:12px}.wx-real-result{padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}.wx-real-result>header{display:flex;align-items:center;justify-content:space-between;gap:8px}.wx-real-result>header strong{font-size:11px}.wx-real-result>header span{color:var(--dsw-alias-label-secondary);font-size:9px}.wx-real-result>small{display:block;margin-top:4px;color:var(--dsw-alias-label-caption);font:9px/1.4 var(--ds-font-family-code,ui-monospace,monospace)}.wx-real-result details{margin-top:7px}.wx-real-result summary{color:var(--dsw-alias-label-secondary);font-size:10px;cursor:pointer}.wx-real-result pre{max-height:180px;margin:5px 0 0;padding:7px;overflow:auto;border-radius:7px;background:var(--dsw-alias-bg-base);white-space:pre-wrap;overflow-wrap:anywhere;font-size:9px}.wx-real-result ol,.wx-member-feedback{margin:6px 0 0;padding-left:18px;color:var(--dsw-alias-label-secondary);font-size:9px}.wx-real-result ol li{display:flex;justify-content:space-between;gap:8px}.wx-member-feedback{list-style:none;padding:0;display:grid;gap:4px}.wx-member-feedback li{display:flex;gap:6px}.wx-feedback-form>div{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:6px}.wx-feedback-form button{min-height:30px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font-size:9px;cursor:pointer}.wx-feedback-form button:first-child{color:var(--dsw-alias-state-success-primary)}.wx-feedback-form button:last-child{color:var(--dsw-alias-state-error-primary)}
+        .wx-real-work{margin:0 0 18px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 4%,var(--dsw-alias-bg-base))}.wx-real-work-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.wx-real-work h3{margin:0;font:600 14px/1.4 ui-serif,"Songti SC","STSong",serif}.wx-real-work-head span{padding:3px 7px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent);color:var(--dsw-alias-state-success-primary);font-size:10px}.wx-real-work>p{margin:7px 0;color:var(--dsw-alias-label-secondary);font-size:10px;line-height:1.5}.wx-real-work>label,.wx-feedback-form>label{display:block;margin-top:9px;color:var(--dsw-alias-label-tertiary);font-size:10px}.wx-real-work input,.wx-real-work textarea{box-sizing:border-box;width:100%;margin-top:5px;padding:8px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:11px/1.5 var(--ds-font-family-code,ui-monospace,monospace);resize:vertical}.wx-real-work>.wx-primary{width:100%;min-height:36px;margin-top:9px}.wx-real-work>small{display:block;margin-top:6px;color:var(--dsw-alias-label-caption);font-size:9px}.wx-real-results,.wx-feedback-changes{display:grid;gap:8px;margin-top:12px}.wx-real-result,.wx-feedback-change{padding:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}.wx-real-result>header,.wx-feedback-change>header{display:flex;align-items:center;justify-content:space-between;gap:8px}.wx-real-result>header strong,.wx-feedback-change>header strong{font-size:11px}.wx-real-result>header span,.wx-feedback-change>header small{color:var(--dsw-alias-label-secondary);font-size:9px}.wx-real-result>small,.wx-feedback-change>small{display:block;margin-top:4px;color:var(--dsw-alias-label-caption);font:9px/1.4 var(--ds-font-family-code,ui-monospace,monospace)}.wx-feedback-change>p{margin:6px 0 0;color:var(--dsw-alias-label-secondary);font-size:9px;overflow-wrap:anywhere}.wx-contract-diff{display:grid;gap:6px;margin-top:8px}.wx-contract-diff section{padding:7px;border-radius:8px;background:var(--dsw-alias-bg-base)}.wx-contract-diff h5{margin:0 0 5px;font-size:10px}.wx-contract-diff dl{margin:0;display:grid;gap:5px}.wx-contract-diff dl>div{display:grid;grid-template-columns:42px minmax(0,1fr);gap:6px;font-size:9px;line-height:1.45}.wx-contract-diff dt{color:var(--dsw-alias-label-tertiary)}.wx-contract-diff dd{margin:0;color:var(--dsw-alias-label-secondary);white-space:pre-wrap}.wx-contract-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}.wx-contract-actions button,.wx-member-feedback button,.wx-resume-feedback{min-height:28px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-state-business-primary);font-size:9px;cursor:pointer}.wx-resume-feedback{width:100%;margin-top:8px}.wx-contract-actions button:last-child{color:var(--dsw-alias-state-error-primary)}.wx-real-result details{margin-top:7px}.wx-real-result summary{color:var(--dsw-alias-label-secondary);font-size:10px;cursor:pointer}.wx-real-result pre{max-height:180px;margin:5px 0 0;padding:7px;overflow:auto;border-radius:7px;background:var(--dsw-alias-bg-base);white-space:pre-wrap;overflow-wrap:anywhere;font-size:9px}.wx-real-result ol,.wx-member-feedback{margin:6px 0 0;padding-left:18px;color:var(--dsw-alias-label-secondary);font-size:9px}.wx-real-result ol li{display:flex;justify-content:space-between;gap:8px}.wx-member-feedback{list-style:none;padding:0;display:grid;gap:4px}.wx-member-feedback li{display:flex;align-items:center;flex-wrap:wrap;gap:6px}.wx-feedback-form>div{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:6px}.wx-feedback-form button{min-height:30px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font-size:9px;cursor:pointer}.wx-feedback-form button:first-child{color:var(--dsw-alias-state-success-primary)}.wx-feedback-form button:last-child{color:var(--dsw-alias-state-error-primary)}
         .wx-evidence{margin:0 0 18px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:var(--dsw-alias-bg-base)}.wx-evidence-head{display:grid;gap:10px}.wx-evidence h3,.wx-evidence h4{margin:0;font:600 14px/1.4 ui-serif,"Songti SC","STSong",serif}.wx-evidence h4{margin-top:14px;font-size:12px}.wx-evidence dl{margin:0;display:grid;grid-template-columns:1fr 1fr;gap:7px}.wx-evidence dl>div{padding:8px;border-radius:9px;background:var(--dsw-alias-bg-layer-1)}.wx-evidence dt{color:var(--dsw-alias-label-tertiary);font-size:9px}.wx-evidence dd{margin:3px 0 0;color:var(--dsw-alias-label-primary);font:650 11px/1.4 var(--ds-font-family-code,ui-monospace,monospace)}.wx-rerun{width:100%;min-height:36px;margin-top:10px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-state-business-primary);font:650 11px/16px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer}.wx-rerun:disabled{opacity:.45;cursor:default}.wx-evidence-note{margin:5px 2px 0;color:var(--dsw-alias-label-caption);font-size:9px;line-height:1.45}.wx-case-results,.wx-run-history ol{list-style:none;margin:8px 0 0;padding:0;display:grid;gap:6px}.wx-case-results li,.wx-run-history li{padding:9px;border:1px solid var(--dsw-alias-border-l1);border-radius:9px}.wx-case-results li>div{display:flex;align-items:center;gap:6px}.wx-case-results strong{font-size:11px}.wx-case-results li>div span{padding:2px 5px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);font-size:8px}.wx-case-results li>b{display:block;margin-top:4px;color:var(--dsw-alias-label-secondary);font-size:10px}.wx-case-results li[data-status=passed]>b{color:var(--dsw-alias-state-success-primary)}.wx-case-results li[data-status=failed]>b,.wx-case-results li[data-status=cancelled]>b{color:var(--dsw-alias-state-error-primary)}.wx-case-results p{margin:5px 0 0;color:var(--dsw-alias-state-error-primary);font-size:10px;line-height:1.45}.wx-case-results small{display:block;margin-top:4px;color:var(--dsw-alias-label-caption);font:9px/1.4 var(--ds-font-family-code,ui-monospace,monospace);overflow-wrap:anywhere}.wx-evidence-empty{margin:8px 0 0;color:var(--dsw-alias-label-tertiary);font-size:10px}.wx-run-history{margin-top:10px}.wx-run-history summary{color:var(--dsw-alias-label-secondary);font-size:10px;cursor:pointer}.wx-run-history li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px;color:var(--dsw-alias-label-tertiary);font:9px/1.4 var(--ds-font-family-code,ui-monospace,monospace)}.wx-run-history li>b{color:var(--dsw-alias-label-secondary)}.wx-run-history li>small,.wx-run-history li>p,.wx-run-input{grid-column:1/-1}.wx-run-input pre{max-height:160px;margin:5px 0 0;padding:7px;overflow:auto;border-radius:7px;background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;overflow-wrap:anywhere}.wx-run-history li>p{margin:0;color:var(--dsw-alias-state-error-primary);font:10px/1.45 var(--ds-font-family-text,ui-sans-serif,system-ui)}
         .wx-alert{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:10px 0;padding:10px 12px;border-radius:10px;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent);color:var(--dsw-alias-state-warn-primary);font-size:12px;line-height:1.55}.wx-alert[data-kind=error]{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 9%,transparent);color:var(--dsw-alias-state-error-primary)}.wx-alert[data-kind=success]{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 9%,transparent);color:var(--dsw-alias-state-success-primary)}.wx-alert button{flex:none;border:0;background:transparent;color:inherit;text-decoration:underline;cursor:pointer}
         .wx-brief-fields{display:flex;flex-direction:column;gap:10px}.wx-brief-field{padding:13px;border:1px solid var(--dsw-alias-border-l1);border-radius:14px;background:color-mix(in srgb,var(--dsw-alias-bg-base) 62%,var(--dsw-alias-bg-layer-1));transition:border-color .14s ease}.wx-brief-field:focus-within{border-color:var(--dsw-alias-border-l2)}.wx-field-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}.wx-field-head>div{display:flex;align-items:baseline;gap:7px}.wx-field-head h3{margin:0;font:560 15px/1.35 ui-serif,"Songti SC","STSong",serif}.wx-field-head>div>span{color:var(--dsw-alias-label-caption);font-size:10px}.wx-source{flex:none;padding:3px 7px;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);font:500 10px/15px var(--ds-font-family-code,ui-monospace,monospace)}.wx-source[data-source=user_confirmed]{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 11%,transparent);color:var(--dsw-alias-state-business-primary)}.wx-source[data-source=inferred]{background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent);color:var(--dsw-alias-state-warn-primary)}.wx-brief-field textarea,.wx-community-input{box-sizing:border-box;width:100%;min-height:62px;padding:8px 9px;border:1px solid transparent;border-radius:9px;background:transparent;color:var(--dsw-alias-label-primary);font:400 13px/1.62 var(--ds-font-family-text,ui-sans-serif,system-ui);resize:vertical;outline:none}.wx-brief-field textarea::placeholder,.wx-community-input::placeholder{color:var(--dsw-alias-label-caption)}.wx-field-foot{min-height:22px;margin-top:5px;display:flex;justify-content:space-between;align-items:center;gap:10px;color:var(--dsw-alias-label-caption);font-size:10px}.wx-field-foot button{border:0;border-radius:7px;padding:4px 8px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-state-business-primary);font:600 11px/16px var(--ds-font-family-text,ui-sans-serif,system-ui);cursor:pointer}

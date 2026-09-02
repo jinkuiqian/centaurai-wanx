@@ -52,6 +52,8 @@ const makingPolicy = `You are Wanxiang, continuing the same conversation in whic
 
 The confirmed work description is the current contract. Work in one continuous make-and-verify loop: inspect the real materials, make the smallest useful implementation, run representative and boundary checks immediately, explain failures in plain language, and revise until there is evidence for every acceptance criterion. Code generation alone is not completion.
 
+When a persisted real-run feedback asks for changes, call wanxiang_plan_feedback_change before editing. Classify it as implementation only when goal, inputs, outputs, permissions, boundaries and success criteria stay unchanged; then edit the implementation and let the Host run the protected Eval plus the original real case automatically. Otherwise submit a contractPatch, do not edit files, and wait for the member to accept or reject the visible work-description diff. Never loosen or rewrite evaluation criteria to manufacture a pass.
+
 Before editing a new project's Workflow directly, call wanxiang_generate_work_agent once with a deterministic implementation, task-specific input and output JSON Schemas, and one smoke case derived from the confirmed work description. The Host binds these artifacts to the confirmed work-description revision and runs the protected smoke Eval automatically. Do not reuse customer-follow-up fields unless the confirmed work is actually customer follow-up.
 
 Keep artifacts readable and versionable inside the current project. Never claim a Data Agent or external system is connected when only a sample contract exists. Preview risky writes and obtain the native approval before any external message, deletion, payment, credential use, or other irreversible side effect. The community drawer is external support, not an approval stage.`;
@@ -100,6 +102,7 @@ export function apply(ctx) {
     projectService: service,
     evaluationStore,
     evaluationTool,
+    workRun,
     evaluatedExecutions: generationEvaluations,
   });
   void service.prepareRoots().catch(() => {});
@@ -115,6 +118,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.tools.register(createWorkAgentGenerationTool(
     service, evaluationStore, evaluationTool, generationEvaluations,
   )));
+  ctx.effect(() => ctx.tools.register(createRunFeedbackChangeTool(service)));
   ctx.effect(() => ctx.on('tools/pre-execute', automaticEvaluation.before));
   ctx.effect(() => ctx.on('tools/post-execute', automaticEvaluation.after));
   if (!ctx.tools.get('web_fetch')) {
@@ -243,6 +247,7 @@ export function apply(ctx) {
   registerApi(ctx, '/api/wanxiang/evaluation/rerun', createEvaluationApiHandler(ctx, service, evaluationTool));
   registerApi(ctx, '/api/wanxiang/work-run', createRealWorkRunApiHandler(ctx, service, workRun));
   registerApi(ctx, '/api/wanxiang/run-feedback', createRunFeedbackApiHandler(ctx, service));
+  registerApi(ctx, '/api/wanxiang/feedback-change', createRunFeedbackChangeDecisionApiHandler(ctx, service));
 
   // v0.2 clients may still finish an already-reserved operation while upgrading.
   registerApi(ctx, '/api/wanxiang/dispatch', async (request) => {
@@ -529,12 +534,101 @@ export function createRunFeedbackApiHandler(ctx, service) {
       workspaceId, baseVersion, { runId, verdict, note }, sessionId,
     );
     const snapshot = await service.getProjectEvidence(workspaceId);
+    return [200, createProjectResponse(state, {
+      evaluation: snapshot.evaluation,
+      feedbackId: state.feedback.order.at(-1),
+    })];
+  };
+}
+
+export function createRunFeedbackChangeDecisionApiHandler(ctx, service) {
+  return async (request) => {
+    requireMethod(request, 'POST');
+    const payload = requireObject(await readJson(request));
+    rejectUnknownKeys(payload, [
+      'workspaceId', 'sessionId', 'baseVersion', 'improvementId', 'decision',
+    ], '工作说明提案决定参数');
+    const workspaceId = requiredText(payload.workspaceId, '项目 ID', 200);
+    const sessionId = requiredText(payload.sessionId, '会话 ID', 200);
+    const baseVersion = nonNegativeInteger(payload.baseVersion, '基础版本', 1);
+    const improvementId = requiredText(payload.improvementId, '改进记录 ID', 200);
+    const decision = enumValue(payload.decision, '提案决定', ['accept', 'reject']);
+    await requireActivationAgent(ctx, service, workspaceId, sessionId, { requireIdle: true });
+    const state = await service.decideRunFeedbackChange(
+      workspaceId, baseVersion, { improvementId, decision }, sessionId,
+    );
+    const snapshot = await service.getProjectEvidence(workspaceId);
     return [200, createProjectResponse(state, { evaluation: snapshot.evaluation })];
   };
 }
 
+export function createRunFeedbackChangeTool(service) {
+  return {
+    name: 'wanxiang_plan_feedback_change',
+    description: 'Classify one persisted member feedback before changing the work Agent. Use implementation only when the confirmed work description remains unchanged; otherwise submit a contract patch and wait for explicit member confirmation.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        baseStateVersion: { type: 'integer' },
+        feedbackId: { type: 'string' },
+        kind: { type: 'string', enum: ['implementation', 'contract'] },
+        contractPatch: {
+          type: 'object',
+          additionalProperties: false,
+          properties: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, { type: 'string' }])),
+        },
+      },
+      required: ['baseStateVersion', 'feedbackId', 'kind'],
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true,
+        properties: {
+          ok: { type: 'boolean' }, improvementId: { type: 'string' },
+          kind: { type: 'string' }, status: { type: 'string' }, diff: { type: 'array' }, nextAction: { type: 'string' },
+        },
+        required: ['ok', 'improvementId', 'kind', 'status', 'diff', 'nextAction'],
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args, execution) {
+      const input = requireObject(args, '反馈修改计划参数无效。');
+      rejectUnknownKeys(input, ['baseStateVersion', 'feedbackId', 'kind', 'contractPatch'], '反馈修改计划参数');
+      const baseVersion = nonNegativeInteger(input.baseStateVersion, '基础版本', 1);
+      const feedbackId = requiredText(input.feedbackId, '反馈 ID', 200);
+      const kind = enumValue(input.kind, '修改范围', ['implementation', 'contract']);
+      const context = await service.contextForAgent(execution?.agent);
+      const sessionId = String(execution?.agent?.id || '');
+      if (!context?.state || !sessionId || context.state.work?.sessionId !== sessionId) {
+        throw serviceError(403, 'feedback_change_session_required', '需要在原制作会话中处理反馈。');
+      }
+      const contractPatch = kind === 'contract'
+        ? validateProjectPatch({ answers: requireObject(input.contractPatch, '请提供工作说明差异。') }).answers
+        : undefined;
+      const state = await service.planRunFeedbackChange(
+        String(context.workspaceId), baseVersion,
+        { feedbackId, kind, ...(contractPatch ? { contractPatch } : {}) }, sessionId,
+      );
+      const improvement = [...state.improvements.order].reverse()
+        .map((improvementId) => state.improvements.byId[improvementId])
+        .find((item) => item.feedbackId === feedbackId
+          && ['planned', 'awaiting_confirmation'].includes(item.status));
+      if (!improvement) throw serviceError(500, 'feedback_change_not_recorded', '反馈修改计划未能保存。');
+      return {
+        ok: true,
+        improvementId: improvement.id,
+        kind: improvement.kind,
+        status: improvement.status,
+        diff: improvement.diff,
+        nextAction: improvement.nextAction,
+      };
+    },
+  };
+}
+
 export function createAutomaticEvaluationHooks({
-  projectService, evaluationStore = null, evaluationTool, evaluatedExecutions = null,
+  projectService, evaluationStore = null, evaluationTool, workRun = null, evaluatedExecutions = null,
 }) {
   const snapshots = new WeakMap();
   return {
@@ -546,7 +640,11 @@ export function createAutomaticEvaluationHooks({
         if (context?.state && context.state.work?.sessionId === String(execution.agent.id)
           && context.state.work?.activeRevision === context.state.brief?.revision
           && typeof context.workspacePath === 'string') {
-          snapshots.set(execution, { context, files: await workflowFileSnapshot(context.workspacePath) });
+          snapshots.set(execution, {
+            context,
+            files: await workflowFileSnapshot(context.workspacePath),
+            improvement: plannedImplementationImprovement(context.state),
+          });
         }
       } catch (error) {
         snapshots.set(execution, { error });
@@ -577,9 +675,11 @@ export function createAutomaticEvaluationHooks({
       }
       if (JSON.stringify(after) === JSON.stringify(before.files)) return decision;
       if (alreadyEvaluated) return decision;
+      let revised = null;
+      let feedbackRerun = null;
       try {
         if (before.files.agent !== null && before.files.agent === after.agent) {
-          await evaluationStore?.reviseGeneratedAgent({
+          revised = await evaluationStore?.reviseGeneratedAgent({
             workspaceId: String(before.context.workspaceId),
             workspacePath: before.context.workspacePath,
           });
@@ -588,11 +688,46 @@ export function createAutomaticEvaluationHooks({
           ? { ...execution, signal: new AbortController().signal }
           : execution;
         const evaluationRun = await evaluationTool.execute({}, evaluationExecution);
+        if (before.improvement) {
+          if (!revised?.agent?.agentVersion || !Number.isInteger(revised?.eval?.revision)) {
+            throw serviceError(500, 'feedback_agent_revision_missing', '无法确认反馈修改后的 Agent 版本。');
+          }
+          if (evaluationRun?.status !== 'passed') {
+            throw serviceError(409, 'feedback_evaluation_failed', '受保护评测未全部通过，已停止真实案例重跑。');
+          }
+          if (revised.eval.revision !== before.improvement.before.evalRevision) {
+            throw serviceError(409, 'feedback_eval_revision_changed', '反馈修改改变了受保护验收标准，已停止重跑。');
+          }
+          if (typeof workRun?.retryFeedback !== 'function') {
+            throw serviceError(503, 'feedback_retry_unavailable', '真实案例重跑环境尚未就绪。');
+          }
+          feedbackRerun = await workRun.retryFeedback(before.improvement.feedbackId, evaluationExecution);
+          await projectService.completeRunFeedbackChange(String(before.context.workspaceId), {
+            improvementId: before.improvement.id,
+            afterAgentVersion: revised.agent.agentVersion,
+            rerunId: feedbackRerun.runId,
+            evalRevision: revised.eval.revision,
+          });
+        }
         return addAutomaticEvaluationNotice(
           decision,
-          `万象已自动运行当前 Eval：${evaluationRun.summary || evaluationRun.status}。请检查逐案例证据后再继续修改。`,
+          before.improvement
+            ? `万象已自动运行当前 Eval：${evaluationRun.summary || evaluationRun.status}；原真实案例已自动重跑（${feedbackRerun.status}）。请核对新结果。`
+            : `万象已自动运行当前 Eval：${evaluationRun.summary || evaluationRun.status}。请检查逐案例证据后再继续修改。`,
         );
       } catch (error) {
+        if (before.improvement && typeof projectService.failRunFeedbackChange === 'function') {
+          await projectService.failRunFeedbackChange(String(before.context.workspaceId), {
+            improvementId: before.improvement.id,
+            ...(revised?.agent?.agentVersion ? { afterAgentVersion: revised.agent.agentVersion } : {}),
+            ...(Number.isInteger(revised?.eval?.revision) ? { evalRevision: revised.eval.revision } : {}),
+            ...(feedbackRerun?.runId || error?.evidence?.runId ? { rerunId: feedbackRerun?.runId || error.evidence.runId } : {}),
+            error: {
+              code: typeof error?.code === 'string' ? error.code : 'feedback_change_failed',
+              message: error instanceof Error ? error.message : '反馈修改未能完成。',
+            },
+          }).catch(() => {});
+        }
         return addAutomaticEvaluationNotice(
           decision,
           `Workflow 已修改，但自动评测未完成：${error instanceof Error ? error.message : '评测服务暂时不可用'}。请先重跑当前修订再继续修改。`,
@@ -600,6 +735,12 @@ export function createAutomaticEvaluationHooks({
       }
     },
   };
+}
+
+function plannedImplementationImprovement(state) {
+  return [...(state?.improvements?.order || [])].reverse()
+    .map((improvementId) => state.improvements.byId[improvementId])
+    .find((item) => item?.kind === 'implementation' && item.status === 'planned') || null;
 }
 
 function addAutomaticEvaluationNotice(decision, text) {

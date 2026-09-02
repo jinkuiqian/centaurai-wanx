@@ -74,15 +74,14 @@ export function createWorkRunAdapter({
   createRunId = randomUUID,
   now = () => new Date().toISOString(),
 }) {
-  return {
-    async execute(args, execution) {
+  async function executeRun(args, execution, retry = null) {
       validateWorkRunArgs(args);
       const agent = execution?.agent;
       const sessionId = String(agent?.id || '');
       if (!agent?.session || !sessionId || agent.session.header?.origin === 'subagent') {
         throw workRunError('work_run_session_required', '需要在当前原生会话中开始影子运行。', 403);
       }
-      const context = await projectService.contextForAgent(agent);
+      const context = retry?.context ?? await projectService.contextForAgent(agent);
       if (!context?.state || context.state.work?.sessionId !== sessionId
         || context.state.work?.activeRevision !== context.state.brief?.revision) {
         throw workRunError('work_run_activation_required', '请先在当前会话确认工作说明并开始制作。', 409);
@@ -107,7 +106,7 @@ export function createWorkRunAdapter({
       const runStart = {
         runId,
         sessionId,
-        caseId: `real-case-${runId}`,
+        caseId: retry?.sourceRun.caseId ?? `real-case-${runId}`,
         caseTitle: args.caseTitle.trim(),
         kind: 'real',
         input,
@@ -115,7 +114,7 @@ export function createWorkRunAdapter({
         workflowVersion: evaluation.workflow.workflowVersion,
         evalRevision: evaluation.eval.revision,
         workBriefRevision: context.state.brief.revision,
-        retryOf: null,
+        retryOf: retry?.sourceRun.runId ?? null,
         startedAt,
       };
       await projectService.startRealWorkRun(String(context.workspaceId), runStart);
@@ -164,6 +163,30 @@ export function createWorkRunAdapter({
           evidence,
         });
       }
+  }
+
+  return {
+    execute(args, execution) {
+      return executeRun(args, execution);
+    },
+    async retryFeedback(feedbackId, execution) {
+      if (typeof feedbackId !== 'string' || !feedbackId) {
+        throw workRunError('feedback_retry_invalid', '反馈重跑请求无效。', 400);
+      }
+      const agent = execution?.agent;
+      const context = await projectService.contextForAgent(agent);
+      const feedback = context?.state?.feedback?.byId?.[feedbackId];
+      const improvement = context?.state?.improvements?.order
+        ?.map((improvementId) => context.state.improvements.byId[improvementId])
+        .find((item) => item.feedbackId === feedbackId && item.kind === 'implementation' && item.status === 'planned');
+      const sourceRun = context?.state?.runs?.byId?.[feedback?.runId];
+      if (!improvement || !sourceRun || sourceRun.kind !== 'real' || sourceRun.status === 'running') {
+        throw workRunError('feedback_retry_unavailable', '找不到可重跑的原反馈和真实案例。', 409);
+      }
+      return executeRun({ caseTitle: sourceRun.caseTitle, input: sourceRun.input }, execution, {
+        context,
+        sourceRun,
+      });
     },
   };
 }
@@ -182,7 +205,7 @@ function workRunEvidence({ runStart, context, output, completedAt, status, summa
   const outputValue = completed ? structuredClone(output) : null;
   return {
     runId: runStart.runId,
-    retryOf: null,
+    retryOf: runStart.retryOf,
     kind: 'real',
     projectId: String(context.workspaceId),
     sessionId: runStart.sessionId,

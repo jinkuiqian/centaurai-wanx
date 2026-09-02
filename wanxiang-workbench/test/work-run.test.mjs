@@ -203,6 +203,64 @@ test('证据发布失败时仍提交项目与会话终态，并保留可恢复�
   assert.equal(events[1].data.status, 'passed');
 });
 
+test('反馈驱动重跑复用原案例与输入并保留 retry 谱系', async () => {
+  const starts = [];
+  const finishes = [];
+  const sourceRun = {
+    runId: 'run-before', sessionId: 'session-1', caseId: 'real-case-1', caseTitle: '九月客户记录',
+    kind: 'real', agentVersion: '1.0.0', workflowVersion: '1.0.0', evalRevision: 2,
+    workBriefRevision: 4, input: { transcript: '客户希望下周回访' }, retryOf: null, status: 'passed',
+  };
+  const context = {
+    workspaceId: 'project-1', workspacePath: '/managed/project',
+    state: {
+      brief: { revision: 4 }, work: { sessionId: 'session-1', activeRevision: 4 },
+      runs: { byId: { 'run-before': sourceRun } },
+      feedback: { byId: { 'feedback-1': { id: 'feedback-1', runId: 'run-before' } } },
+      improvements: {
+        order: ['improvement-1'],
+        byId: { 'improvement-1': { id: 'improvement-1', feedbackId: 'feedback-1', kind: 'implementation', status: 'planned' } },
+      },
+    },
+  };
+  const session = { header: {}, append() {} };
+  const agent = { id: 'session-1', session };
+  const workRun = createWorkRunAdapter({
+    projectService: {
+      async contextForAgent() { return context; },
+      async startRealWorkRun(projectId, value) { starts.push({ projectId, value: structuredClone(value) }); },
+      async finishRun(projectId, value) { finishes.push({ projectId, value: structuredClone(value) }); },
+    },
+    evaluationStore: {
+      async load() {
+        return {
+          agent: { agentVersion: '1.0.1', workBriefRevision: 4 },
+          workflow: { workflowVersion: '1.0.1', entrypoint: 'workflow.mjs' },
+          source: 'workflow source', eval: { revision: 2, cases: [] },
+        };
+      },
+    },
+    runner: { async run({ input }) { return { action: `修正：${input.transcript}` }; } },
+    evidenceStore: { async save() {} },
+    flushSession: async () => {},
+    createRunId: () => 'run-after',
+    now: sequenceClock('2026-09-02T10:01:00.000Z', '2026-09-02T10:01:01.000Z'),
+  });
+
+  const result = await workRun.retryFeedback('feedback-1', {
+    agent, signal: new AbortController().signal,
+  });
+
+  assert.equal(result.runId, 'run-after');
+  assert.equal(result.retryOf, 'run-before');
+  assert.equal(result.caseId, 'real-case-1');
+  assert.deepEqual(result.input, sourceRun.input);
+  assert.equal(result.agentVersion, '1.0.1');
+  assert.equal(starts[0].value.retryOf, 'run-before');
+  assert.equal(starts[0].value.caseId, 'real-case-1');
+  assert.deepEqual(finishes.map(({ value }) => value.status), ['passed']);
+});
+
 function sequenceClock(...values) {
   let index = 0;
   return () => values[Math.min(index++, values.length - 1)];

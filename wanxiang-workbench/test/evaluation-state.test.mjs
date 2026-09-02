@@ -152,6 +152,12 @@ test('a generated Agent behavior change advances its version before the next eva
   assert.equal(revised.eval.agentVersion, '1.0.1');
   assert.equal(revised.eval.workflowVersion, '1.0.1');
   assert.equal(revised.agent.workBriefRevision, 2);
+  assert.deepEqual(revised.versions.map(({ agentVersion }) => agentVersion), ['1.0.0', '1.0.1']);
+  assert.equal(revised.versions[0].source, "process.stdout.write(JSON.stringify({ items: [] }));\n");
+  assert.equal(revised.versions[1].source, "process.stdout.write(JSON.stringify({ items: [], changed: true }));\n");
+
+  const reloaded = await fixture.store.load(fixture.project);
+  assert.deepEqual(reloaded.versions, revised.versions);
 });
 
 test('generation rejects smoke inputs and expected outputs that contradict their contracts', async (t) => {
