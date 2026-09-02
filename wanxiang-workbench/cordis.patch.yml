@@ -19,6 +19,10 @@
   config:
     policy: never
 
+# Web 默认关闭工作流执行引擎；万象用它在受限 worker 中运行代理评测。
+- id: workflow-worker-thread
+  disabled: false
+
 - id: permission
   config:
     defaultPreset: wanxiang-discovery

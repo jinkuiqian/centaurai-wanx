@@ -100,6 +100,32 @@ test('isolates the runtime home, filters inherited credentials, and renders the 
   }
 });
 
+test('boots the real web profile with the Wanxiang workbench plugin activated', async (t) => {
+  const dataRoot = await mkdtemp(path.join(tmpdir(), 'wanxiang-real-runtime-'));
+  const manager = new WanxiangRuntimeManager({ dataRoot, port: 0, startTimeoutMs: 20_000 });
+  t.after(async () => {
+    try {
+      await manager.stop();
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true });
+    }
+  });
+  const result = await manager.launch();
+
+  assert.match(result.url, /^http:\/\/127\.0\.0\.1:\d+\/\?token=/u);
+  assert.ok(result.port > 0);
+  assert.equal(manager.running?.child.exitCode, null);
+  const endpoint = new URL(result.url);
+  endpoint.pathname = '/api/wanxiang/projects';
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ projectName: '启动验收' }),
+  });
+  assert.equal(response.status, 201);
+  assert.equal((await response.json()).state.projectName, '启动验收');
+});
+
 test('seeds the warm light theme once and preserves later explicit choices', async () => {
   const dataRoot = await mkdtemp(path.join(tmpdir(), 'wanxiang-appearance-'));
   const explicitRoot = await mkdtemp(path.join(tmpdir(), 'wanxiang-appearance-explicit-'));
