@@ -11,6 +11,7 @@ import {
   createEvaluationApiHandler,
   createProjectResponse,
   createPublicWebFetchTool,
+  createWorkAgentGenerationTool,
   createWorkBriefTool,
   discoveryToolAllowed,
   evaluationPolicy,
@@ -56,7 +57,109 @@ test('workbench composition registers the proxy-run tool adapter and DSH project
   assert.ok(inject.includes('workflowEngine'));
   assert.ok(inject.includes('sessionProjections'));
   assert.equal(registeredTools.get('wanxiang_run_evaluation')?.name, 'wanxiang_run_evaluation');
+  assert.equal(registeredTools.get('wanxiang_generate_work_agent')?.name, 'wanxiang_generate_work_agent');
   assert.equal(projections.get('wanxiang.proxy-run')?.stateVersion, 3);
+});
+
+test('work Agent generation tool derives the confirmed contract from the active root session', async () => {
+  const agent = { id: 'session-root', session: { header: { cwd: '/managed/meeting-notes' } } };
+  const state = createInitialState('会议纪要整理');
+  state.brief.revision = 4;
+  state.brief.confirmedRevision = 4;
+  state.brief.confirmedAnswers = {
+    ...state.brief.answers,
+    goal: '把访谈记录整理成可执行的会议纪要',
+    inputs: '一段访谈逐字稿',
+    examples: '一条带负责人的访谈待办',
+    rules: '按截止日期排序',
+    output: '包含决定和待办事项的 JSON',
+    boundaries: '不发送消息',
+    success: '每项待办都包含负责人和截止日期',
+  };
+  state.work = { sessionId: 'session-root', activeRevision: 4, activation: { status: 'active' } };
+  let received;
+  const evaluationCalls = [];
+  const tool = createWorkAgentGenerationTool({
+    async contextForAgent(actual) {
+      assert.equal(actual, agent);
+      return { workspaceId: 'workspace-1', workspacePath: '/managed/meeting-notes', state };
+    },
+  }, {
+    async generate(project, request) {
+      received = { project, request };
+      return {
+        agent: { agentVersion: '1.0.0', workBriefRevision: 4, workflowVersion: '1.0.0', evalRevision: 2 },
+        eval: { cases: [{ id: request.smokeCase.id }] },
+      };
+    },
+  }, {
+    async execute(args, execution) {
+      evaluationCalls.push({ args, execution });
+      return { status: 'passed', runId: 'run-smoke-1' };
+    },
+  });
+  const definition = {
+    workflowSource: "process.stdout.write(JSON.stringify({ notes: [] }));\n",
+    inputSchema: { type: 'object', properties: { transcript: { type: 'string' } }, required: ['transcript'] },
+    outputSchema: { type: 'object', properties: { notes: { type: 'array' } }, required: ['notes'] },
+    smokeCase: {
+      id: 'meeting-notes-smoke-v1',
+      title: '最小访谈记录',
+      input: { transcript: '确定下周发布' },
+      expected: { notes: [] },
+    },
+  };
+
+  const result = await tool.execute(definition, { agent });
+
+  assert.deepEqual(received.project, { workspaceId: 'workspace-1', workspacePath: '/managed/meeting-notes' });
+  assert.equal(received.request.projectName, '会议纪要整理');
+  assert.equal(received.request.workBriefRevision, 4);
+  assert.deepEqual(received.request.brief, {
+    goal: '把访谈记录整理成可执行的会议纪要',
+    inputs: '一段访谈逐字稿',
+    examples: '一条带负责人的访谈待办',
+    rules: '按截止日期排序',
+    output: '包含决定和待办事项的 JSON',
+    boundaries: '不发送消息',
+    success: '每项待办都包含负责人和截止日期',
+  });
+  assert.equal(received.request.workflowSource, definition.workflowSource);
+  assert.equal(evaluationCalls.length, 1);
+  assert.deepEqual(evaluationCalls[0].args, { caseId: 'meeting-notes-smoke-v1' });
+  assert.equal(evaluationCalls[0].execution.agent, agent);
+  assert.deepEqual(result, {
+    ok: true,
+    agentVersion: '1.0.0',
+    workBriefRevision: 4,
+    workflowVersion: '1.0.0',
+    evalRevision: 2,
+    smokeCaseId: 'meeting-notes-smoke-v1',
+  });
+});
+
+test('work Agent generation tool rejects sessions without the active confirmed work brief', async () => {
+  const state = createInitialState('未开始项目');
+  state.brief.revision = 1;
+  state.brief.confirmedRevision = 1;
+  state.work = { sessionId: null, activeRevision: null, activation: null };
+  const tool = createWorkAgentGenerationTool({
+    async contextForAgent() {
+      return { workspaceId: 'workspace-1', workspacePath: '/managed/project', state };
+    },
+  }, { async generate() { assert.fail('inactive project must not generate'); } }, {
+    async execute() { assert.fail('inactive project must not evaluate'); },
+  });
+
+  await assert.rejects(tool.execute({
+    workflowSource: "process.stdout.write('{}')",
+    inputSchema: { type: 'object', properties: {} },
+    outputSchema: { type: 'object', properties: {} },
+    smokeCase: { id: 'smoke-v1', title: '冒烟', input: {}, expected: {} },
+  }, { agent: { id: 'session-root', session: { header: {} } } }), {
+    code: 'agent_generation_activation_required',
+    statusCode: 409,
+  });
 });
 
 test('work-description tool derives the project from the calling root agent and writes inferred sparse fields', async () => {
@@ -293,9 +396,11 @@ test('successful Workflow mutations through any tool force one full Eval in the 
   await mkdir(artifactRoot, { recursive: true });
   await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'old source');
   await writeFile(path.join(artifactRoot, 'workflow.json'), '{}');
+  await writeFile(path.join(artifactRoot, 'agent.json'), '{"agentVersion":"1.0.0"}');
   const agent = { id: 'session-root', session: { header: { cwd: workspacePath } } };
   const state = { brief: { revision: 4 }, work: { sessionId: agent.id, activeRevision: 4 } };
   const calls = [];
+  const revisions = [];
   const hooks = createAutomaticEvaluationHooks({
     projectService: {
       async contextForAgent(actual) {
@@ -308,6 +413,9 @@ test('successful Workflow mutations through any tool force one full Eval in the 
         calls.push({ args, execution });
         return { status: 'passed', summary: '5 个代理案例全部通过' };
       },
+    },
+    evaluationStore: {
+      async reviseGeneratedAgent(project) { revisions.push(project); },
     },
   });
   const accepted = { kind: 'accept' };
@@ -322,6 +430,7 @@ test('successful Workflow mutations through any tool force one full Eval in the 
   assert.equal(decision.kind, 'accept');
   assert.match(decision.additionalContexts[0].content[0].text, /5 个代理案例全部通过/u);
   assert.equal(calls.length, 1);
+  assert.deepEqual(revisions, [{ workspaceId: 'workspace-1', workspacePath }]);
   assert.deepEqual(calls[0].args, {});
   assert.equal(calls[0].execution, execution);
 
@@ -330,12 +439,14 @@ test('successful Workflow mutations through any tool force one full Eval in the 
   await writeFile(path.join(workspacePath, 'README.md'), 'unrelated');
   await hooks.after(unrelated, { isError: false }, async () => accepted);
   assert.equal(calls.length, 1);
+  assert.equal(revisions.length, 1);
 
   const partialFailure = { ...execution, arguments: { code: 'write then exit nonzero' } };
   await hooks.before(partialFailure, async () => accepted);
   await writeFile(path.join(artifactRoot, 'workflow.mjs'), 'changed before tool error');
   await hooks.after(partialFailure, { isError: true }, async () => accepted);
   assert.equal(calls.length, 2);
+  assert.equal(revisions.length, 2);
 
   const controller = new AbortController();
   const cancelledAfterWrite = { ...execution, signal: controller.signal };
@@ -344,6 +455,7 @@ test('successful Workflow mutations through any tool force one full Eval in the 
   controller.abort();
   await hooks.after(cancelledAfterWrite, { isError: true }, async () => accepted);
   assert.equal(calls.length, 3);
+  assert.equal(revisions.length, 3);
   assert.equal(calls[2].execution.signal.aborted, false);
 });
 

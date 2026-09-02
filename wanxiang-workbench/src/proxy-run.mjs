@@ -18,15 +18,21 @@ const PROXY_RUN_SCRIPT = `const stable = (value) => {
 };
 const expected = args.expected;
 const actual = args.actual;
-const assertions = [{
+const customerFollowUp = Array.isArray(expected.missingFollowUps) && expected.markdown && typeof expected.markdown === "object";
+const assertions = customerFollowUp ? [{
   id: "structured-missing-follow-ups",
   passed: JSON.stringify(stable(actual.missingFollowUps)) === JSON.stringify(stable(expected.missingFollowUps)),
+}] : [{
+  id: "structured-output",
+  passed: JSON.stringify(stable(actual)) === JSON.stringify(stable(expected)),
 }];
-for (const [group, fragments] of Object.entries(expected.markdown)) {
-  fragments.forEach((fragment, index) => assertions.push({
-    id: "markdown-" + group + "-" + index,
-    passed: typeof actual.reportMarkdown === "string" && actual.reportMarkdown.includes(fragment),
-  }));
+if (customerFollowUp) {
+  for (const [group, fragments] of Object.entries(expected.markdown)) {
+    fragments.forEach((fragment, index) => assertions.push({
+      id: "markdown-" + group + "-" + index,
+      passed: typeof actual.reportMarkdown === "string" && actual.reportMarkdown.includes(fragment),
+    }));
+  }
 }
 const passed = assertions.every((item) => item.passed);
 return {
@@ -66,6 +72,7 @@ export function applyProxyRunEvent(state, event) {
       sessionId: data.sessionId,
       caseId: data.caseId,
       workflowVersion: data.workflowVersion,
+      ...(data.agentVersion ? { agentVersion: data.agentVersion } : {}),
       evalRevision: data.evalRevision,
       workBriefRevision: data.workBriefRevision,
       retryOf: data.retryOf ?? null,
@@ -268,8 +275,7 @@ export function createProxyRunToolAdapter({
           summary: passed
             ? `${results.length} 个代理案例全部通过`
             : `${results.filter((result) => result.status === 'passed').length}/${results.length} 个代理案例通过`,
-          workflowVersion: evaluation.workflow.workflowVersion,
-          evalRevision: evaluation.eval.revision,
+          ...evaluationVersionTrace(evaluation, context.state.brief.revision),
           results,
         };
       }
@@ -281,9 +287,7 @@ export function createProxyRunToolAdapter({
         runId,
         sessionId,
         caseId: evalCase.id,
-        workflowVersion: evaluation.workflow.workflowVersion,
-        evalRevision: evaluation.eval.revision,
-        workBriefRevision: context.state.brief.revision,
+        ...evaluationVersionTrace(evaluation, context.state.brief.revision),
         retryOf: args.retryOf?.trim() || null,
         startedAt,
       };
@@ -380,9 +384,7 @@ function evaluationEvidence({ runId, retryOf, context, sessionId, evaluation, ev
     retryOf,
     projectId: String(context.workspaceId),
     sessionId,
-    workflowVersion: evaluation.workflow.workflowVersion,
-    evalRevision: evaluation.eval.revision,
-    workBriefRevision: context.state.brief.revision,
+    ...evaluationVersionTrace(evaluation, context.state.brief.revision),
     caseId: evalCase.id,
     status: value.status,
     startedAt,
@@ -392,6 +394,15 @@ function evaluationEvidence({ runId, retryOf, context, sessionId, evaluation, ev
     assertions: value.assertions,
     ...(value.output ? { output: value.output } : {}),
     ...(value.error ? { error: value.error } : {}),
+  };
+}
+
+function evaluationVersionTrace(evaluation, workBriefRevision) {
+  return {
+    ...(evaluation.agent?.agentVersion ? { agentVersion: evaluation.agent.agentVersion } : {}),
+    workflowVersion: evaluation.workflow.workflowVersion,
+    evalRevision: evaluation.eval.revision,
+    workBriefRevision,
   };
 }
 

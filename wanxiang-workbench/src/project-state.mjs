@@ -647,6 +647,7 @@ export class WanxiangStateService {
       return {
         state,
         evaluation: {
+          agentVersion: evaluation.agent?.agentVersion ?? null,
           workflowVersion: evaluation.workflow.workflowVersion,
           evalRevision: evaluation.eval.revision,
           cases: evaluation.eval.cases.map(({ id, title, kind }) => ({ id, title, kind })),
@@ -1619,8 +1620,9 @@ function isEvaluationRuns(value) {
 
 function isEvaluationRunStart(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
-    && Object.keys(value).every((key) => ['runId', 'sessionId', 'caseId', 'workflowVersion', 'evalRevision', 'workBriefRevision', 'retryOf', 'startedAt'].includes(key))
+    && Object.keys(value).every((key) => ['runId', 'sessionId', 'caseId', 'agentVersion', 'workflowVersion', 'evalRevision', 'workBriefRevision', 'retryOf', 'startedAt'].includes(key))
     && ['runId', 'sessionId', 'caseId', 'workflowVersion', 'startedAt'].every((key) => typeof value[key] === 'string' && value[key])
+    && (value.agentVersion === undefined || (typeof value.agentVersion === 'string' && value.agentVersion))
     && Number.isInteger(value.evalRevision) && value.evalRevision > 0
     && Number.isInteger(value.workBriefRevision) && value.workBriefRevision >= 0
     && (value.retryOf === null || (typeof value.retryOf === 'string' && value.retryOf));
@@ -1643,6 +1645,7 @@ function isEvaluationRun(value) {
     runId: value.runId,
     sessionId: value.sessionId,
     caseId: value.caseId,
+    ...(value.agentVersion ? { agentVersion: value.agentVersion } : {}),
     workflowVersion: value.workflowVersion,
     evalRevision: value.evalRevision,
     workBriefRevision: value.workBriefRevision,

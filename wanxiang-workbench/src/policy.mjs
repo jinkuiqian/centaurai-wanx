@@ -51,6 +51,8 @@ const makingPolicy = `You are Wanxiang, continuing the same conversation in whic
 
 The confirmed work description is the current contract. Work in one continuous make-and-verify loop: inspect the real materials, make the smallest useful implementation, run representative and boundary checks immediately, explain failures in plain language, and revise until there is evidence for every acceptance criterion. Code generation alone is not completion.
 
+Before editing a new project's Workflow directly, call wanxiang_generate_work_agent once with a deterministic implementation, task-specific input and output JSON Schemas, and one smoke case derived from the confirmed work description. The Host binds these artifacts to the confirmed work-description revision and runs the protected smoke Eval automatically. Do not reuse customer-follow-up fields unless the confirmed work is actually customer follow-up.
+
 Keep artifacts readable and versionable inside the current project. Never claim a Data Agent or external system is connected when only a sample contract exists. Preview risky writes and obtain the native approval before any external message, deletion, payment, credential use, or other irreversible side effect. The community drawer is external support, not an approval stage.`;
 export const evaluationPolicy = `The editable deterministic implementation is .wanxiang/${WORKFLOW_ENTRYPOINT} with its fixed manifest at .wanxiang/${WORKFLOW_MANIFEST}. This is a proxy vertical slice over synthetic material, not a shadow or real run. After every successful change to the Workflow or its manifest, call wanxiang_run_evaluation once without caseId so all protected cases run immediately; do not wait for another user message. Inspect every case result before making the next change. .wanxiang/evals.json is a read-only mirror of protected representative cases and expected results: never edit it to make the implementation pass.`;
 
@@ -85,15 +87,21 @@ export function apply(ctx) {
     evidenceStore: runEvidenceStore,
     flushSession: (session) => ctx.sessions.flush(session),
   });
+  const generationEvaluations = new WeakSet();
   const automaticEvaluation = createAutomaticEvaluationHooks({
     projectService: service,
+    evaluationStore,
     evaluationTool,
+    evaluatedExecutions: generationEvaluations,
   });
   void service.prepareRoots().catch(() => {});
 
   ctx.effect(() => ctx.tools.register(createWorkBriefTool(service)));
   ctx.effect(() => ctx.sessionProjections.register(createProxyRunProjectionDefinition()));
   ctx.effect(() => ctx.tools.register(evaluationTool));
+  ctx.effect(() => ctx.tools.register(createWorkAgentGenerationTool(
+    service, evaluationStore, evaluationTool, generationEvaluations,
+  )));
   ctx.effect(() => ctx.on('tools/pre-execute', automaticEvaluation.before));
   ctx.effect(() => ctx.on('tools/post-execute', automaticEvaluation.after));
   if (!ctx.tools.get('web_fetch')) {
@@ -276,6 +284,100 @@ export function apply(ctx) {
   }));
 }
 
+export function createWorkAgentGenerationTool(service, evaluationStore, evaluationTool, evaluatedExecutions = null) {
+  return {
+    name: 'wanxiang_generate_work_agent',
+    description: 'Generate the current project\'s smallest deterministic work Agent from its active confirmed work description. Creates task-specific contracts and one protected smoke case; the Host automatically runs the Eval after generation.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        workflowSource: {
+          type: 'string',
+          description: 'Deterministic JavaScript read from stdin and writing one JSON object to stdout. No imports, network, environment, filesystem or external side effects.',
+        },
+        inputSchema: { type: 'object', additionalProperties: true },
+        outputSchema: { type: 'object', additionalProperties: true },
+        smokeCase: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string' },
+            title: { type: 'string' },
+            input: { type: 'object', additionalProperties: true },
+            expected: { type: 'object', additionalProperties: true },
+          },
+          required: ['id', 'title', 'input', 'expected'],
+        },
+      },
+      required: ['workflowSource', 'inputSchema', 'outputSchema', 'smokeCase'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          agentVersion: { type: 'string' },
+          workBriefRevision: { type: 'integer' },
+          workflowVersion: { type: 'string' },
+          evalRevision: { type: 'integer' },
+          smokeCaseId: { type: 'string' },
+        },
+        required: ['ok', 'agentVersion', 'workBriefRevision', 'workflowVersion', 'evalRevision', 'smokeCaseId'],
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      presentationMeta: (_args, value) => ({
+        kind: 'wanxiang-work-agent',
+        agentVersion: value.agentVersion,
+        evalRevision: value.evalRevision,
+      }),
+    },
+    async execute(args, execution) {
+      const agent = execution?.agent;
+      const sessionId = String(agent?.id || '');
+      if (!agent?.session || !sessionId || agent.session.header?.origin === 'subagent') {
+        throw serviceError(403, 'agent_generation_session_required', '需要在当前万象根会话中生成工作 Agent。');
+      }
+      const context = await service.contextForAgent(agent);
+      const state = context?.state;
+      if (!state || state.work?.sessionId !== sessionId
+        || state.work?.activeRevision !== state.brief?.revision
+        || state.brief?.confirmedRevision !== state.brief?.revision
+        || !state.brief?.confirmedAnswers) {
+        throw serviceError(409, 'agent_generation_activation_required', '请先确认当前工作说明并在这个会话开始制作。');
+      }
+      if (!evaluationStore || !evaluationTool || typeof context.workspacePath !== 'string') {
+        throw serviceError(503, 'agent_generation_unavailable', '工作 Agent 生成环境尚未就绪。');
+      }
+      const answers = state.brief.confirmedAnswers;
+      const generated = await evaluationStore.generate({
+        workspaceId: String(context.workspaceId),
+        workspacePath: context.workspacePath,
+      }, {
+        ...args,
+        projectName: state.projectName,
+        workBriefRevision: state.brief.confirmedRevision,
+        brief: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, answers[key]])),
+      });
+      evaluatedExecutions?.add(execution);
+      const smokeCaseId = generated.eval.cases[0].id;
+      const smokeRun = await evaluationTool.execute({ caseId: smokeCaseId }, execution);
+      if (smokeRun?.status !== 'passed') {
+        throw serviceError(409, 'agent_generation_smoke_failed', '工作 Agent 已生成，但冒烟案例未通过；请根据运行证据修正后重试。');
+      }
+      return {
+        ok: true,
+        agentVersion: generated.agent.agentVersion,
+        workBriefRevision: generated.agent.workBriefRevision,
+        workflowVersion: generated.agent.workflowVersion,
+        evalRevision: generated.agent.evalRevision,
+        smokeCaseId,
+      };
+    },
+  };
+}
+
 export function createDiscoveryAuthorizationGuard(ctx, authorization) {
   return (execution) => {
     const agent = execution.agent;
@@ -377,7 +479,9 @@ export function createEvaluationApiHandler(ctx, service, evaluationTool) {
   };
 }
 
-export function createAutomaticEvaluationHooks({ projectService, evaluationTool }) {
+export function createAutomaticEvaluationHooks({
+  projectService, evaluationStore = null, evaluationTool, evaluatedExecutions = null,
+}) {
   const snapshots = new WeakMap();
   return {
     before: async (execution, next) => {
@@ -397,6 +501,8 @@ export function createAutomaticEvaluationHooks({ projectService, evaluationTool 
     },
     after: async (execution, result, next) => {
       const decision = await next();
+      const alreadyEvaluated = evaluatedExecutions?.has(execution) ?? false;
+      evaluatedExecutions?.delete(execution);
       const before = snapshots.get(execution);
       snapshots.delete(execution);
       if (!before) return decision;
@@ -416,7 +522,14 @@ export function createAutomaticEvaluationHooks({ projectService, evaluationTool 
         );
       }
       if (JSON.stringify(after) === JSON.stringify(before.files)) return decision;
+      if (alreadyEvaluated) return decision;
       try {
+        if (before.files.agent !== null && before.files.agent === after.agent) {
+          await evaluationStore?.reviseGeneratedAgent({
+            workspaceId: String(before.context.workspaceId),
+            workspacePath: before.context.workspacePath,
+          });
+        }
         const evaluationExecution = execution.signal?.aborted
           ? { ...execution, signal: new AbortController().signal }
           : execution;
@@ -448,7 +561,10 @@ function addAutomaticEvaluationNotice(decision, text) {
 async function workflowFileSnapshot(workspacePath) {
   const read = (filename) => readFile(path.join(workspacePath, '.wanxiang', filename), 'utf8')
     .catch((error) => error?.code === 'ENOENT' ? null : Promise.reject(error));
-  return Promise.all([read(WORKFLOW_ENTRYPOINT), read(WORKFLOW_MANIFEST)]);
+  const [entrypoint, manifest, agent] = await Promise.all([
+    read(WORKFLOW_ENTRYPOINT), read(WORKFLOW_MANIFEST), read('agent.json'),
+  ]);
+  return { entrypoint, manifest, agent };
 }
 
 export function createWorkBriefTool(service) {

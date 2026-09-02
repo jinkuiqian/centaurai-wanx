@@ -323,6 +323,69 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   });
 });
 
+test('generated work Agent runs a task-specific smoke case and records the Agent version', async () => {
+  const events = [];
+  const saved = [];
+  const session = { header: {}, append(type, data) { events.push({ type, data: structuredClone(data) }); } };
+  const agent = { id: 'session-1', session };
+  const expected = {
+    title: '产品访谈',
+    actions: [{ task: '整理反馈', owner: '林岚', due: '2026-09-05' }],
+  };
+  const tool = createProxyRunToolAdapter({
+    projectService: {
+      async contextForAgent() {
+        return {
+          workspaceId: 'project-1', workspacePath: '/managed/project',
+          state: { brief: { revision: 4 }, work: { sessionId: 'session-1', activeRevision: 4 }, runs: { order: [], byId: {} } },
+        };
+      },
+      async startEvaluationRun() {},
+      async finishEvaluationRun() {},
+    },
+    evaluationStore: {
+      async load() {
+        return {
+          agent: { agentVersion: '1.0.0' },
+          workflow: { workflowVersion: '1.0.0', entrypoint: 'workflow.mjs' },
+          source: 'workflow source',
+          eval: {
+            revision: 2,
+            cases: [{
+              id: 'meeting-notes-smoke-v1', title: '一条带负责人的待办', kind: 'normal',
+              input: { transcript: '产品访谈决定整理反馈' }, expected,
+            }],
+          },
+        };
+      },
+    },
+    runner: { async run() { return structuredClone(expected); } },
+    workflowEngine: {
+      start(request) {
+        const value = Function('args', request.script)(request.args);
+        return {
+          result: Promise.resolve({ value, stopReason: 'completed', agentsStarted: 0 }),
+          async dispose() {},
+        };
+      },
+    },
+    evidenceStore: { async save(evidence) { saved.push(structuredClone(evidence)); } },
+    flushSession: async () => {},
+    createRunId: () => 'run-meeting-notes-1',
+    now: sequenceClock('2026-09-02T10:00:00.000Z', '2026-09-02T10:00:01.000Z'),
+  });
+
+  const result = await tool.execute({ caseId: 'meeting-notes-smoke-v1' }, { agent });
+
+  assert.equal(result.status, 'passed');
+  assert.deepEqual(result.output, expected);
+  assert.equal(result.agentVersion, '1.0.0');
+  assert.equal(saved[0].agentVersion, '1.0.0');
+  assert.equal(events[0].data.agentVersion, '1.0.0');
+  assert.equal(events[0].data.workBriefRevision, 4);
+  assert.equal(events[0].data.evalRevision, 2);
+});
+
 test('DSH start fact persistence failure finalizes the protected project run with failure evidence', async () => {
   const caseId = 'normal-case-v2';
   const events = [];

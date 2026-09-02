@@ -39,6 +39,9 @@ test('prepares a draft project without manufacturing a confirmed brief', async (
     assert.equal(contract.stateVersion, 1);
     assert.equal(contract.managedBy, 'wanxiang');
     assert.equal(contract.connected, false);
+    assert.equal(contract.status, 'awaiting-confirmed-work-brief');
+    assert.deepEqual(contract.sources, []);
+    assert.doesNotMatch(JSON.stringify(contract), /customers|communications/u);
     assert.match(instructions, /团队自己的规则/);
     assert.match(instructions, /WANXIANG:MANAGED:START version=2/);
     assert.match(instructions, /制作与验证是同一个循环/);

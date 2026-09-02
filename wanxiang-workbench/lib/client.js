@@ -143,6 +143,7 @@ window.__ModuleLoader__.load({
     function normalizeEvaluation(value) {
       const source = value && typeof value === "object" ? value : {};
       return {
+        agentVersion: typeof source.agentVersion === "string" ? source.agentVersion : null,
         workflowVersion: typeof source.workflowVersion === "string" ? source.workflowVersion : null,
         evalRevision: Number.isInteger(source.evalRevision) ? source.evalRevision : null,
         cases: Array.isArray(source.cases) ? source.cases.filter((item) => item && typeof item.id === "string").map((item) => ({
@@ -743,6 +744,7 @@ window.__ModuleLoader__.load({
         h("div", { className: "wx-evidence-head" },
           h("h3", { id: "wx-evidence-title" }, "运行证据"),
           h("dl", null,
+            h("div", null, h("dt", null, "Agent 版本"), h("dd", null, project.evaluation.agentVersion ? `v${project.evaluation.agentVersion}` : "尚未就绪")),
             h("div", null, h("dt", null, "Workflow 版本"), h("dd", null, project.evaluation.workflowVersion ? `v${project.evaluation.workflowVersion}` : "尚未就绪")),
             h("div", null, h("dt", null, "Eval 修订"), h("dd", null, Number.isInteger(project.evaluation.evalRevision) ? `r${project.evaluation.evalRevision}` : "尚未就绪")))),
         h("button", {
@@ -768,7 +770,7 @@ window.__ModuleLoader__.load({
             const passedAssertions = assertions.filter((assertion) => assertion?.passed === true).length;
             return h("li", { key: run.runId },
               h("span", null, run.runId), h("b", null, statusLabel(run)),
-              h("small", null, `Workflow v${run.workflowVersion} · Eval r${run.evalRevision}`),
+              h("small", null, `${run.agentVersion ? `Agent v${run.agentVersion} · ` : ""}Workflow v${run.workflowVersion} · Eval r${run.evalRevision}`),
               assertions.length ? h("small", null, `断言 ${passedAssertions}/${assertions.length}`) : null,
               run.evidence?.input ? h("details", { className: "wx-run-input" },
                 h("summary", null, "输入快照"),

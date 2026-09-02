@@ -54,6 +54,127 @@ test('evaluation project store exposes five transparent customer follow-up fixtu
   );
 });
 
+test('confirmed work brief generates project-specific Agent artifacts and one traceable smoke case', async (t) => {
+  const fixture = await evaluationFixture(t);
+  const generated = await fixture.store.generate(fixture.project, {
+    projectName: '会议纪要整理',
+    workBriefRevision: 4,
+    brief: {
+      goal: '把访谈记录整理成可执行的会议纪要',
+      inputs: '一段访谈逐字稿',
+      examples: '产品访谈中确定了一项由林岚负责的待办',
+      rules: '待办按截止日期排序',
+      output: '包含决定和待办事项的 JSON',
+      boundaries: '不发送通知，不改写日历',
+      success: '每项待办都包含负责人和截止日期',
+    },
+    workflowSource: `let body = '';
+process.stdin.setEncoding('utf8');
+for await (const chunk of process.stdin) body += chunk;
+const input = JSON.parse(body);
+process.stdout.write(JSON.stringify({ title: input.title, actions: input.actions }));
+`,
+    inputSchema: {
+      type: 'object',
+      properties: { title: { type: 'string' }, actions: { type: 'array' } },
+      required: ['title', 'actions'],
+    },
+    outputSchema: {
+      type: 'object',
+      properties: { title: { type: 'string' }, actions: { type: 'array' } },
+      required: ['title', 'actions'],
+    },
+    smokeCase: {
+      id: 'meeting-notes-smoke-v1',
+      title: '一条带负责人的待办',
+      input: { title: '产品访谈', actions: [{ task: '整理反馈', owner: '林岚', due: '2026-09-05' }] },
+      expected: { title: '产品访谈', actions: [{ task: '整理反馈', owner: '林岚', due: '2026-09-05' }] },
+    },
+  });
+
+  assert.equal(generated.agent.agentVersion, '1.0.0');
+  assert.equal(generated.agent.workBriefRevision, 4);
+  assert.equal(generated.agent.workflowVersion, '1.0.0');
+  assert.equal(generated.agent.evalRevision, 2);
+  assert.equal(generated.agent.contract.goal, '把访谈记录整理成可执行的会议纪要');
+  assert.equal(generated.agent.contract.examples, '产品访谈中确定了一项由林岚负责的待办');
+  assert.equal(generated.agent.contract.rules, '待办按截止日期排序');
+  assert.equal(generated.agent.contract.boundaries, '不发送通知，不改写日历');
+  assert.equal(generated.workflow.agentVersion, generated.agent.agentVersion);
+  assert.equal(generated.workflow.workBriefRevision, 4);
+  assert.equal(generated.eval.workBriefRevision, 4);
+  assert.equal(generated.eval.agentVersion, generated.agent.agentVersion);
+  assert.equal(generated.eval.workflowVersion, generated.workflow.workflowVersion);
+  assert.deepEqual(generated.eval.contract, generated.agent.contract);
+  assert.deepEqual(generated.eval.inputSchema, generated.dataContract.input.schema);
+  assert.deepEqual(generated.eval.outputSchema, generated.dataContract.output.schema);
+  assert.deepEqual(generated.eval.cases.map(({ id }) => id), ['meeting-notes-smoke-v1']);
+
+  const artifactRoot = path.join(fixture.workspacePath, '.wanxiang');
+  const agent = JSON.parse(await readFile(path.join(artifactRoot, 'agent.json'), 'utf8'));
+  const dataContract = JSON.parse(await readFile(path.join(artifactRoot, 'data-contract.json'), 'utf8'));
+  assert.deepEqual(agent, generated.agent);
+  assert.equal(dataContract.workBriefRevision, 4);
+  assert.equal(dataContract.input.description, '一段访谈逐字稿');
+  assert.equal(dataContract.output.description, '包含决定和待办事项的 JSON');
+  assert.doesNotMatch(JSON.stringify({ agent, dataContract, eval: generated.eval }), /customersCsv|missingFollowUps/u);
+
+  const reloaded = await fixture.store.load(fixture.project);
+  assert.deepEqual(reloaded.agent, agent);
+  assert.equal(reloaded.eval.revision, 2);
+  assert.deepEqual(reloaded.eval.cases.map(({ id }) => id), ['meeting-notes-smoke-v1']);
+});
+
+test('a generated Agent behavior change advances its version before the next evaluation', async (t) => {
+  const fixture = await evaluationFixture(t);
+  const request = {
+    projectName: '清单整理',
+    workBriefRevision: 2,
+    brief: {
+      goal: '整理待办清单', inputs: '待办 JSON', examples: '', rules: '',
+      output: '排序后的待办 JSON', boundaries: '不修改来源', success: '待办按日期排序',
+    },
+    workflowSource: "process.stdout.write(JSON.stringify({ items: [] }));\n",
+    inputSchema: { type: 'object', properties: { items: { type: 'array' } }, required: ['items'] },
+    outputSchema: { type: 'object', properties: { items: { type: 'array' } }, required: ['items'] },
+    smokeCase: { id: 'todo-smoke-v1', title: '空清单', input: { items: [] }, expected: { items: [] } },
+  };
+  const initial = await fixture.store.generate(fixture.project, request);
+  await writeFile(path.join(fixture.workspacePath, '.wanxiang', 'workflow.mjs'),
+    "process.stdout.write(JSON.stringify({ items: [], changed: true }));\n");
+
+  const revised = await fixture.store.reviseGeneratedAgent(fixture.project);
+
+  assert.equal(initial.agent.agentVersion, '1.0.0');
+  assert.equal(revised.agent.agentVersion, '1.0.1');
+  assert.equal(revised.workflow.workflowVersion, '1.0.1');
+  assert.equal(revised.eval.revision, initial.eval.revision);
+  assert.equal(revised.eval.agentVersion, '1.0.1');
+  assert.equal(revised.eval.workflowVersion, '1.0.1');
+  assert.equal(revised.agent.workBriefRevision, 2);
+});
+
+test('generation rejects smoke inputs and expected outputs that contradict their contracts', async (t) => {
+  const fixture = await evaluationFixture(t);
+  const base = {
+    projectName: '纪要', workBriefRevision: 1,
+    brief: {
+      goal: '整理纪要', inputs: '逐字稿', examples: '', rules: '', output: '纪要 JSON', boundaries: '', success: '包含标题',
+    },
+    workflowSource: "process.stdout.write(JSON.stringify({ title: '周会' }));\n",
+    inputSchema: { type: 'object', properties: { transcript: { type: 'string' } }, required: ['transcript'] },
+    outputSchema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] },
+    smokeCase: { id: 'notes-smoke-v1', title: '周会', input: { transcript: '发布' }, expected: { title: '周会' } },
+  };
+
+  await assert.rejects(fixture.store.generate(fixture.project, {
+    ...base, smokeCase: { ...base.smokeCase, input: { text: '发布' } },
+  }), { code: 'agent_generation_invalid' });
+  await assert.rejects(fixture.store.generate(fixture.project, {
+    ...base, smokeCase: { ...base.smokeCase, expected: { title: 42 } },
+  }), { code: 'agent_generation_invalid' });
+});
+
 test('editing the visible Eval cannot change the protected current acceptance revision', async (t) => {
   const fixture = await evaluationFixture(t);
   const initial = await fixture.store.load(fixture.project);

@@ -114,12 +114,9 @@ export class WanxiangRuntimeManager {
       schemaVersion: 1,
       stateVersion: 1,
       managedBy: 'wanxiang',
-      status: 'sample-contract-only',
+      status: 'awaiting-confirmed-work-brief',
       connected: false,
-      sources: [
-        { id: 'customers', mode: 'read', fields: ['status', 'owner', 'lastFollowUpAt'] },
-        { id: 'communications', mode: 'read', windowDays: 180, fields: ['summary', 'purchaseIntent'] },
-      ],
+      sources: [],
       restrictions: ['no external writes', 'no messages', 'no credential access'],
     };
 

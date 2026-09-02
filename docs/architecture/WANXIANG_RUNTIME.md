@@ -39,6 +39,7 @@ workspace/
 └── .wanxiang/
     ├── project.json
     ├── work-brief.md
+    ├── agent.json
     ├── data-contract.json
     ├── workflow.json
     ├── evals.json
@@ -47,6 +48,8 @@ workspace/
 ```
 
 工作区路径是项目身份的一部分。`.wanxiang/project.json` 是可审查、可迁移的镜像；运行时受保护目录中的状态才是唯一写入事实源，避免制作工具绕过 CAS。首次导入可以由镜像恢复，但不得覆盖已经存在的权威状态。
+
+工作说明生效后，同一个万象根会话通过受控生成工具提交确定性 Workflow、输入/输出 JSON Schema 和一个任务专属冒烟案例。Host 从已确认快照写入 `agent.json`、`data-contract.json`、`workflow.json` 和受保护 Eval，不接受调用者自报工作说明版本。Agent、Workflow、Eval 和运行证据共同记录工作说明修订；默认能力固定为当前项目、无网络、无外部副作用。客户跟进五案例只作为旧代理垂直切片与平台回归夹具，生成其他工作 Agent 时不会复用其字段。
 
 ## 工作简报一致性
 
