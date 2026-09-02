@@ -305,14 +305,14 @@ export function createProxyRunToolAdapter({
           terminal?.conclusion ?? (evidence.status === 'passed' ? 'passed' : 'failed'), result.stopReason,
         );
         if (failure) {
-          throw Object.assign(proxyRunError(failure.code, failure.message, failure.statusCode), { evaluationRecorded: true });
+          throw Object.assign(proxyRunError(failure.code, failure.message, failure.statusCode), { evaluationTerminalCommitted: true });
         }
         if (evidence.status !== 'passed') {
-          throw Object.assign(proxyRunError('proxy_run_assertion_failed', evidence.summary), { evaluationRecorded: true });
+          throw Object.assign(proxyRunError('proxy_run_assertion_failed', evidence.summary), { evaluationTerminalCommitted: true });
         }
         return evidence;
       } catch (error) {
-        if (error?.evaluationRecorded) throw error;
+        if (error?.evaluationTerminalCommitted) throw error;
         const failure = normalizeFailure(error, execution.signal);
         const terminal = terminalForFailure(failure);
         const evidence = evaluationEvidence({
@@ -329,7 +329,7 @@ export function createProxyRunToolAdapter({
           agent.session, evidenceStore, projectService, flushSession, evidence, terminal.conclusion,
           terminal.status === 'cancelled' ? 'cancelled' : 'error',
         );
-        throw Object.assign(error instanceof Error ? error : new Error(failure.message), failure, { evaluationRecorded: true });
+        throw Object.assign(error instanceof Error ? error : new Error(failure.message), failure, { evaluationTerminalCommitted: true });
       }
     },
   };
@@ -378,7 +378,7 @@ async function recordEvaluationResult(session, evidenceStore, projectService, fl
     const persistenceError = error instanceof Error
       ? error
       : proxyRunError('proxy_run_session_persistence_failed', 'DSH 会话未能持久化代理运行结论。');
-    throw Object.assign(persistenceError, { evaluationRecorded: true });
+    throw Object.assign(persistenceError, { evaluationTerminalCommitted: true });
   }
 }
 

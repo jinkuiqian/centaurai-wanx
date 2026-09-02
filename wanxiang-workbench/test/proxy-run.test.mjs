@@ -363,7 +363,7 @@ test('DSH start fact persistence failure finalizes the protected project run wit
 
   await assert.rejects(
     tool.execute({ caseId }, { agent, signal: new AbortController().signal }),
-    (error) => error.code === 'session_flush_failed' && error.evaluationRecorded === true,
+    (error) => error.code === 'session_flush_failed' && error.evaluationTerminalCommitted === true,
   );
 
   assert.equal(runnerCalls, 0);
@@ -438,7 +438,7 @@ test('DSH terminal fact persistence failure does not rewrite an already finalize
 
   await assert.rejects(
     tool.execute({ caseId }, { agent, signal: new AbortController().signal }),
-    (error) => error.code === 'session_flush_failed' && error.evaluationRecorded === true,
+    (error) => error.code === 'session_flush_failed' && error.evaluationTerminalCommitted === true,
   );
 
   assert.equal(evidenceSaves, 1);
