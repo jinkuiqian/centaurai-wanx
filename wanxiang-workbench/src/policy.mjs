@@ -179,18 +179,18 @@ export function apply(ctx) {
     if (payload.workspaceId !== undefined) {
       const workspaceId = requiredText(payload.workspaceId, '项目 ID', 200);
       const { workspace, state } = await service.importProject(workspaceId);
-      return [200, projectResponse(state, { workspaceId: String(workspace.id), imported: true })];
+      return [200, createProjectResponse(state, { workspaceId: String(workspace.id), imported: true })];
     }
     const projectName = requiredText(payload.projectName, 'Agent 名称', 200);
     const { workspace, state } = await service.createProject(projectName);
-    return [201, projectResponse(state, { workspaceId: String(workspace.id) })];
+    return [201, createProjectResponse(state, { workspaceId: String(workspace.id) })];
   });
 
   registerApi(ctx, '/api/wanxiang/project', async (request) => {
     if (request.method === 'GET') {
       const workspaceId = queryText(request, 'workspaceId', 200);
       const snapshot = await service.getProjectEvidence(workspaceId);
-      return [200, projectResponse(snapshot.state, { evaluation: snapshot.evaluation })];
+      return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation })];
     }
     requireMethod(request, 'PUT');
     const payload = requireObject(await readJson(request));
@@ -198,7 +198,7 @@ export function apply(ctx) {
     const baseVersion = nonNegativeInteger(payload.baseVersion, '基础版本', 1);
     const patch = validateProjectPatch(payload.patch ?? legacyProjectPatch(payload));
     const state = await service.updateProject(workspaceId, baseVersion, patch);
-    return [200, projectResponse(state)];
+    return [200, createProjectResponse(state)];
   });
 
   registerApi(ctx, '/api/wanxiang/project/confirm', async (request) => {
@@ -215,7 +215,7 @@ export function apply(ctx) {
       throw serviceError(409, 'activation_required', '已开始制作的项目必须通过“同步并开始制作”确认新版工作说明。', { current });
     }
     const state = await service.confirmProject(workspaceId, baseVersion, briefRevision);
-    return [200, projectResponse(state)];
+    return [200, createProjectResponse(state)];
   });
 
   registerApi(ctx, '/api/wanxiang/activation', createActivationApiHandler(ctx, service, authorization));
@@ -347,7 +347,7 @@ export function createActivationApiHandler(ctx, service, authorization = null) {
       const messageId = requiredText(payload.messageId, '消息 ID', 500);
       const state = await service.finalizeActivation(workspaceId, { activationId, status, messageId });
       authorization?.update(state, activation.sessionId);
-      return [200, projectResponse(state, { activationId, activation: state.work.activation })];
+      return [200, createProjectResponse(state, { activationId, activation: state.work.activation })];
     }
     const error = structuredActivationError(payload.error);
     const state = await service.finalizeActivation(workspaceId, { activationId, status, error });
@@ -359,7 +359,7 @@ export function createActivationApiHandler(ctx, service, authorization = null) {
         cause,
       });
     });
-    return [200, projectResponse(state, { activationId, activation: state.work.activation })];
+    return [200, createProjectResponse(state, { activationId, activation: state.work.activation })];
   };
 }
 
@@ -373,7 +373,7 @@ export function createEvaluationApiHandler(ctx, service, evaluationTool) {
     const agent = await requireActivationAgent(ctx, service, workspaceId, sessionId, { requireIdle: true });
     const evaluationRun = await evaluationTool.execute({}, { agent, signal: request.signal });
     const snapshot = await service.getProjectEvidence(workspaceId);
-    return [200, projectResponse(snapshot.state, { evaluation: snapshot.evaluation, evaluationRun })];
+    return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation, evaluationRun })];
   };
 }
 
@@ -602,8 +602,9 @@ export function createPublicWebFetchTool(web) {
   };
 }
 
-function projectResponse(state, extra = {}) {
-  return { ok: true, ...extra, state, projection: deriveProjectState(state) };
+export function createProjectResponse(state, extra = {}) {
+  const projection = deriveProjectState(state);
+  return { ok: true, ...extra, state, projection, guidance: projection.guidance };
 }
 
 function activationResponse(ctx, result) {
@@ -612,7 +613,7 @@ function activationResponse(ctx, result) {
   const mode = session && effectivePreset(ctx, 'build') === ctx.permissionPresets.current(session)
     ? 'build'
     : 'discovery';
-  return projectResponse(result.state, {
+  return createProjectResponse(result.state, {
     result: result.disposition,
     activationId: result.activation?.id || null,
     activation: result.activation || null,

@@ -29,7 +29,17 @@ test('v0.3 state contract survives understand-to-make in one canonical session',
       unresolvedOptional: ['examples', 'rules', 'boundaries'],
     },
     guidance: {
+      schemaVersion: 1,
+      stateVersion: 1,
+      briefRevision: 0,
       stage: 'understanding',
+      understanding: {
+        answers: Object.fromEntries(ANSWER_KEYS.map((key) => [key, ''])),
+        fieldSources: Object.fromEntries(ANSWER_KEYS.map((key) => [key, {
+          status: 'unresolved',
+          sourceMessageIds: [],
+        }])),
+      },
       progress: {
         requiredKnown: 0,
         requiredConfirmed: 0,
@@ -37,6 +47,7 @@ test('v0.3 state contract survives understand-to-make in one canonical session',
         allKnown: 0,
         allTotal: 7,
       },
+      unresolvedFields: ANSWER_KEYS,
       deferredFields: ['examples', 'rules', 'boundaries'],
       next: {
         kind: 'ask_field',

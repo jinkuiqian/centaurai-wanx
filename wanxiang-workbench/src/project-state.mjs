@@ -240,41 +240,53 @@ export function deriveGuidance(state) {
   const deferredFields = OPTIONAL_BRIEF_FIELDS.filter((key) => isPlaceholder(state.brief.answers[key])
     || state.brief.fieldSources[key]?.status === 'unresolved');
   const activation = state.work.activation;
+  const result = (...args) => guidance(state, progress, deferredFields, ...args);
 
   if (activation?.status === 'pending') {
-    return guidance('activating', progress, deferredFields, 'activation_pending', null,
+    return result('activating', 'activation_pending', null,
       '万象正在安全切换到制作状态，请等待当前操作完成。');
   }
   if (activation?.status === 'failed' && activation.briefRevision === state.brief.revision) {
-    return guidance('failed', progress, deferredFields, 'retry_activation', null,
+    return result('failed', 'retry_activation', null,
       '上次开始制作没有完成，请检查失败原因后重试。');
   }
   if (state.work.activeRevision !== null && state.brief.revision > state.work.activeRevision) {
-    return guidance('changed', progress, deferredFields, 'sync_changes', null,
+    return result('changed', 'sync_changes', null,
       '工作说明已有修改，请确认同步后继续制作。');
   }
   if (state.work.activeRevision !== null && state.work.activeRevision === state.brief.revision) {
-    return guidance('making', progress, deferredFields, 'continue_making', null,
+    return result('making', 'continue_making', null,
       '工作说明已经生效，请继续制作并用真实材料验证。');
   }
 
   const nextField = REQUIRED_BRIEF_FIELDS.find((key) => !known(key));
   if (nextField) {
-    return guidance('understanding', progress, deferredFields, 'ask_field', nextField,
+    return result('understanding', 'ask_field', nextField,
       GUIDANCE_QUESTIONS[nextField]);
   }
   if (REQUIRED_BRIEF_FIELDS.some((key) => !confirmed(key))) {
-    return guidance('reviewing', progress, deferredFields, 'review_and_confirm', null,
+    return result('reviewing', 'review_and_confirm', null,
       '请打开工作说明，核对制作前的四项关键内容；有误直接修改，确认无误后再开始制作。');
   }
-  return guidance('ready', progress, deferredFields, 'start_making', null,
+  return result('ready', 'start_making', null,
     '工作说明已经确认，可以在当前对话中开始制作。');
 }
 
-function guidance(stage, progress, deferredFields, kind, field, prompt) {
+function guidance(state, progress, deferredFields, stage, kind, field, prompt) {
+  const unresolvedFields = BRIEF_FIELDS.map(([key]) => key).filter((key) => (
+    isPlaceholder(state.brief.answers[key]) || state.brief.fieldSources[key]?.status === 'unresolved'
+  ));
   return {
+    schemaVersion: 1,
+    stateVersion: state.stateVersion,
+    briefRevision: state.brief.revision,
     stage,
+    understanding: {
+      answers: { ...state.brief.answers },
+      fieldSources: cloneFieldSources(state.brief.fieldSources),
+    },
     progress,
+    unresolvedFields,
     deferredFields,
     next: { kind, field, prompt },
   };

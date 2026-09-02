@@ -78,7 +78,25 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
       unresolvedOptional: ['examples', 'rules', 'boundaries'],
     },
     guidance: {
+      schemaVersion: 1,
+      stateVersion: 1,
+      briefRevision: 0,
       stage: 'understanding',
+      understanding: {
+        answers: {
+          goal: '',
+          inputs: '',
+          examples: '',
+          rules: '',
+          output: '',
+          boundaries: '',
+          success: '',
+        },
+        fieldSources: Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, {
+          status: 'unresolved',
+          sourceMessageIds: [],
+        }])),
+      },
       progress: {
         requiredKnown: 0,
         requiredConfirmed: 0,
@@ -86,6 +104,7 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
         allKnown: 0,
         allTotal: 7,
       },
+      unresolvedFields: ['goal', 'inputs', 'examples', 'rules', 'output', 'boundaries', 'success'],
       deferredFields: ['examples', 'rules', 'boundaries'],
       next: {
         kind: 'ask_field',
@@ -93,6 +112,39 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
         prompt: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
       },
     },
+  });
+});
+
+test('guidance snapshot owns the current understanding, unresolved fields and one next action', () => {
+  let state = createInitialState('客户周报');
+  state = updateProjectState(state, {
+    answers: { goal: '把每周客户沟通记录整理成周报' },
+    fieldSources: { goal: { status: 'inferred', sourceMessageIds: ['message-1'] } },
+  });
+
+  const snapshot = deriveGuidance(state);
+
+  assert.equal(snapshot.schemaVersion, 1);
+  assert.equal(snapshot.stateVersion, state.stateVersion);
+  assert.equal(snapshot.briefRevision, state.brief.revision);
+  assert.deepEqual(snapshot.understanding, {
+    answers: state.brief.answers,
+    fieldSources: state.brief.fieldSources,
+  });
+  assert.notEqual(snapshot.understanding.answers, state.brief.answers);
+  assert.notEqual(snapshot.understanding.fieldSources, state.brief.fieldSources);
+  assert.deepEqual(snapshot.unresolvedFields, ['inputs', 'examples', 'rules', 'output', 'boundaries', 'success']);
+  assert.deepEqual(snapshot.progress, {
+    requiredKnown: 1,
+    requiredConfirmed: 0,
+    requiredTotal: 4,
+    allKnown: 1,
+    allTotal: 7,
+  });
+  assert.deepEqual(snapshot.next, {
+    kind: 'ask_field',
+    field: 'inputs',
+    prompt: '请上传或指出一份最近实际使用过的材料；如果不方便上传，请说明它的类型和关键内容。',
   });
 });
 

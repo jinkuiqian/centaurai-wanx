@@ -121,8 +121,13 @@ test('v0.3.1 imports external workspaces from the guidance dock and keeps other 
   assert.match(importWorkspace, /replaceRecord\(workspaceId, \{ busy: true, error: "" \}\)/u);
 });
 
-test('v0.3.1 consumes server guidance with a pure client fallback', () => {
-  assert.match(client, /guidance: normalizeGuidance\(projection\?\.guidance, derived\.guidance\)/u);
+test('v0.3.1 consumes the complete authoritative guidance snapshot with a legacy-only fallback', () => {
+  assert.match(client, /const authoritativeGuidance = normalizeGuidance\(value\?\.guidance \|\| projection\?\.guidance\)/u);
+  assert.match(client, /const understanding = authoritativeGuidance\?\.understanding \|\| source/u);
+  assert.match(client, /const derived = authoritativeGuidance \? null : deriveProjection\(project\)/u);
+  assert.match(client, /guidance: authoritativeGuidance \|\| derived\.guidance/u);
+  assert.doesNotMatch(client, /normalizeGuidance\([^\n]+derived\.guidance/u);
+  assert.match(client, /guidanceReturnsToCanonical\(guidance, project, id\)/u);
   assert.match(client, /function deriveGuidance\(project\)/u);
   for (const kind of ['ask_field', 'review_and_confirm', 'start_making', 'activation_pending', 'continue_making', 'sync_changes', 'retry_activation']) {
     assert.match(client, new RegExp(`"${kind}"`, 'u'));
@@ -130,9 +135,15 @@ test('v0.3.1 consumes server guidance with a pure client fallback', () => {
 });
 
 test('v0.3.1 atomically confirms four complete essentials and reports brief tool progress', () => {
-  assert.match(client, /function activationReady\(project\) \{\s*return requiredKeys\.every\(\(key\) => !isPlaceholderAnswer\(project\.answers\[key\]\)\);/u);
-  const activationReadyBody = client.match(/function activationReady\(project\) \{([\s\S]*?)\n    \}/u)?.[1] || '';
-  assert.doesNotMatch(activationReadyBody, /user_confirmed/u);
+  const allowsBody = client.match(/function guidanceAllowsActivation\(guidance\) \{([\s\S]*?)\n    \}/u)?.[1] || '';
+  const guidanceAllowsActivation = new Function('guidance', allowsBody);
+  assert.equal(guidanceAllowsActivation({ next: { kind: 'ask_field' } }), false);
+  assert.equal(guidanceAllowsActivation({ next: { kind: 'start_making' } }), true);
+  assert.equal(guidanceAllowsActivation({ next: { kind: 'sync_changes' } }), true);
+  assert.match(client, /if \(!guidanceAllowsActivation\(record\.project\.guidance\)\)/u);
+  assert.doesNotMatch(client, /\bactivationReady\b/u);
+  const actionLabelBody = client.match(/function actionLabel\(project, sessionId\) \{([\s\S]*?)\n    \}/u)?.[1] || '';
+  assert.doesNotMatch(actionLabelBody, /project\.phase|project\.answers/u);
   assert.match(client, /原子确认当前工作说明/u);
   assert.match(client, /fieldByKey\[key\]\?\.label/u);
   assert.match(client, /工作说明 \$\{count\}\/7/u);

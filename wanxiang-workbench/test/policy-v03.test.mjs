@@ -9,6 +9,7 @@ import {
   createAutomaticEvaluationHooks,
   createDiscoveryAuthorizationGuard,
   createEvaluationApiHandler,
+  createProjectResponse,
   createPublicWebFetchTool,
   createWorkBriefTool,
   discoveryToolAllowed,
@@ -142,6 +143,39 @@ test('work-description tool keeps confirmed provenance when the model repeats an
   assert.equal(writes, 0);
   assert.equal(state.brief.fieldSources.goal.status, 'user_confirmed');
   assert.equal(result.guidance.next.field, 'inputs');
+});
+
+test('project reads, refreshes and work-description updates share one authoritative guidance snapshot', async () => {
+  let state = createInitialState('客户周报');
+  state = updateProjectState(state, {
+    answers: { goal: '生成客户周报' },
+    fieldSources: { goal: { status: 'inferred', sourceMessageIds: ['message-1'] } },
+  });
+  const tool = createWorkBriefTool({
+    async contextForAgent() { return { workspaceId: 'workspace-1', state }; },
+    async updateProjectForAgent() { assert.fail('unchanged understanding must not write state'); },
+  });
+
+  const read = createProjectResponse(state);
+  const refresh = createProjectResponse(structuredClone(state));
+  const update = await tool.execute({ baseStateVersion: state.stateVersion, patch: { goal: '生成客户周报' } }, {
+    agent: { id: 'session-root', session: { header: {} } },
+  });
+
+  assert.deepEqual(read.guidance, read.projection.guidance);
+  assert.deepEqual(refresh.guidance, read.guidance);
+  assert.deepEqual(update.guidance, read.guidance);
+  assert.deepEqual(Object.keys(read.guidance), [
+    'schemaVersion',
+    'stateVersion',
+    'briefRevision',
+    'stage',
+    'understanding',
+    'progress',
+    'unresolvedFields',
+    'deferredFields',
+    'next',
+  ]);
 });
 
 test('work-description prompt exposes one deterministic next question and response discipline', () => {

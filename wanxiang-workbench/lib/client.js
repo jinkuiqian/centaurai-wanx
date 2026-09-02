@@ -101,28 +101,19 @@ window.__ModuleLoader__.load({
       if (requiredKeys.some((key) => !confirmed(key))) return result("reviewing", "review_and_confirm", null, "请打开工作说明，核对制作前的四项关键内容；有误直接修改，确认无误后再开始制作。");
       return result("ready", "start_making", null, "工作说明已经确认，可以在当前对话中开始制作。");
     }
-    function normalizeGuidance(raw, fallback) {
-      if (!raw || typeof raw !== "object") return fallback;
-      const progress = raw.progress && typeof raw.progress === "object" ? raw.progress : {};
-      const count = (value, fallbackValue) => Number.isInteger(value) && value >= 0 ? value : fallbackValue;
-      const next = raw.next && typeof raw.next === "object" ? raw.next : fallback.next;
-      return {
-        stage: typeof raw.stage === "string" ? raw.stage : fallback.stage,
-        progress: {
-          requiredKnown: count(progress.requiredKnown, fallback.progress.requiredKnown),
-          requiredConfirmed: count(progress.requiredConfirmed, fallback.progress.requiredConfirmed),
-          requiredTotal: count(progress.requiredTotal, fallback.progress.requiredTotal),
-          allKnown: count(progress.allKnown, fallback.progress.allKnown),
-          allTotal: count(progress.allTotal, fallback.progress.allTotal),
-        },
-        deferredFields: Array.isArray(raw.deferredFields)
-          ? raw.deferredFields.filter((key) => fieldKeys.has(key)) : fallback.deferredFields,
-        next: {
-          kind: typeof next?.kind === "string" ? next.kind : fallback.next.kind,
-          field: fieldKeys.has(next?.field) ? next.field : null,
-          prompt: typeof next?.prompt === "string" && next.prompt.trim() ? next.prompt : fallback.next.prompt,
-        },
-      };
+    function normalizeGuidance(raw) {
+      if (raw?.schemaVersion !== 1
+        || !Number.isInteger(raw.stateVersion)
+        || !Number.isInteger(raw.briefRevision)
+        || typeof raw.stage !== "string"
+        || !raw.understanding?.answers
+        || !raw.understanding?.fieldSources
+        || !raw.progress
+        || !Array.isArray(raw.unresolvedFields)
+        || !Array.isArray(raw.deferredFields)
+        || typeof raw.next?.kind !== "string"
+        || typeof raw.next?.prompt !== "string") return null;
+      return raw;
     }
     function deriveProjection(project) {
       const missingRequired = requiredKeys.filter((key) => isPlaceholderAnswer(project.answers[key]));
@@ -183,8 +174,10 @@ window.__ModuleLoader__.load({
       const source = value?.state && typeof value.state === "object"
         ? value.state : value?.project && typeof value.project === "object" ? value.project : value || {};
       const projection = value?.projection && typeof value.projection === "object" ? value.projection : source;
-      const answers = answerObject(source);
-      const fieldSources = fieldSourceObject(source, answers);
+      const authoritativeGuidance = normalizeGuidance(value?.guidance || projection?.guidance);
+      const understanding = authoritativeGuidance?.understanding || source;
+      const answers = answerObject(understanding);
+      const fieldSources = fieldSourceObject(understanding, answers);
       const confirmedRaw = source?.brief?.confirmedAnswers || source?.confirmedAnswers;
       const confirmedAnswers = confirmedRaw ? answerObject(source, "confirmedAnswers") : null;
       const confirmedFieldSources = confirmedAnswers
@@ -206,15 +199,15 @@ window.__ModuleLoader__.load({
         ...source,
         workspaceId: String(source.workspaceId || workspaceId),
         schemaVersion: Number.isInteger(source.schemaVersion) ? source.schemaVersion : 2,
-        baseVersion: Number.isInteger(source.stateVersion)
-          ? source.stateVersion : Number.isInteger(source.baseVersion) ? source.baseVersion : 0,
+        baseVersion: authoritativeGuidance?.stateVersion ?? (Number.isInteger(source.stateVersion)
+          ? source.stateVersion : Number.isInteger(source.baseVersion) ? source.baseVersion : 0),
         projectName: String(source.projectName || "我的工作项目").trim() || "我的工作项目",
         answers,
         fieldSources,
         confirmedAnswers,
         confirmedFieldSources,
-        briefRevision: Number.isInteger(source.brief?.revision)
-          ? source.brief.revision : Number.isInteger(source.briefRevision) ? source.briefRevision : 0,
+        briefRevision: authoritativeGuidance?.briefRevision ?? (Number.isInteger(source.brief?.revision)
+          ? source.brief.revision : Number.isInteger(source.briefRevision) ? source.briefRevision : 0),
         confirmedRevision: Number.isInteger(source.brief?.confirmedRevision)
           ? source.brief.confirmedRevision : Number.isInteger(source.confirmedRevision) ? source.confirmedRevision : null,
         work: {
@@ -227,19 +220,21 @@ window.__ModuleLoader__.load({
         evaluation: normalizeEvaluation(value?.evaluation || source.evaluation || records.get(workspaceId)?.project?.evaluation),
         runs: normalizeRuns(source.runs),
       };
-      const derived = deriveProjection(project);
+      const derived = authoritativeGuidance ? null : deriveProjection(project);
+      const hostPhase = ["understanding", "ready", "making", "changed", "failed"].includes(projection?.phase)
+        ? projection.phase : null;
+      const hostReadiness = projection?.readiness && typeof projection.readiness === "object" ? {
+        ready: projection.readiness.ready === true,
+        missingRequired: Array.isArray(projection.readiness.missingRequired)
+          ? projection.readiness.missingRequired : [],
+        unresolvedOptional: Array.isArray(projection.readiness.unresolvedOptional)
+          ? projection.readiness.unresolvedOptional : [],
+      } : null;
       return {
         ...project,
-        phase: ["understanding", "ready", "making", "changed", "failed"].includes(projection?.phase)
-          ? projection.phase : derived.phase,
-        readiness: projection?.readiness && typeof projection.readiness === "object" ? {
-          ready: projection.readiness.ready === true,
-          missingRequired: Array.isArray(projection.readiness.missingRequired)
-            ? projection.readiness.missingRequired : derived.readiness.missingRequired,
-          unresolvedOptional: Array.isArray(projection.readiness.unresolvedOptional)
-            ? projection.readiness.unresolvedOptional : derived.readiness.unresolvedOptional,
-        } : derived.readiness,
-        guidance: normalizeGuidance(projection?.guidance, derived.guidance),
+        phase: hostPhase || derived?.phase || "understanding",
+        readiness: hostReadiness || derived?.readiness || { ready: false, missingRequired: [], unresolvedOptional: [] },
+        guidance: authoritativeGuidance || derived.guidance,
       };
     }
     function readDraft(workspaceId) {
@@ -470,8 +465,12 @@ window.__ModuleLoader__.load({
         && project.work.sessionId !== sessionId
         && Number.isInteger(project.work.activeRevision));
     }
+    function guidanceReturnsToCanonical(guidance, project, sessionId) {
+      return ["continue_making", "sync_changes"].includes(guidance?.next?.kind)
+        && canonicalSessionElsewhere(project, sessionId);
+    }
     function guidanceActionLabel(guidance, project, sessionId) {
-      if (canonicalSessionElsewhere(project, sessionId)) return "返回制作会话";
+      if (guidanceReturnsToCanonical(guidance, project, sessionId)) return "返回制作会话";
       const labels = {
         review_and_confirm: "确认工作说明并开始制作",
         start_making: "确认并开始制作",
@@ -534,7 +533,7 @@ window.__ModuleLoader__.load({
       };
       const openBrief = (event) => openOverlay("brief", id, event.currentTarget);
       const runGuidanceAction = (event) => {
-        if (canonicalSessionElsewhere(project, id)) {
+        if (guidanceReturnsToCanonical(guidance, project, id)) {
           rootContext.sessions.open(project.work.sessionId);
           return;
         }
@@ -676,16 +675,22 @@ window.__ModuleLoader__.load({
             : confirmable ? h("button", { type: "button", disabled: record.busy, onClick: () => void save(true) }, "确认这项") : null),
       );
     }
-    function activationReady(project) {
-      return requiredKeys.every((key) => !isPlaceholderAnswer(project.answers[key]));
+    function guidanceAllowsActivation(guidance) {
+      return ["review_and_confirm", "start_making", "activation_pending", "sync_changes", "retry_activation"]
+        .includes(guidance?.next?.kind);
     }
     function actionLabel(project, sessionId) {
-      if (canonicalSessionElsewhere(project, sessionId)) return "返回制作会话";
-      if (project.phase === "making" && project.work.activeRevision === project.briefRevision) return "返回制作会话";
-      if (project.phase === "changed") return "确认修改并继续制作";
-      if (project.phase === "failed") return "重新开始制作";
-      if (project.guidance?.stage === "reviewing") return "确认工作说明并开始制作";
-      return "开始制作";
+      const guidance = project.guidance;
+      if (guidanceReturnsToCanonical(guidance, project, sessionId)) return "返回制作会话";
+      const labels = {
+        review_and_confirm: "确认工作说明并开始制作",
+        start_making: "开始制作",
+        activation_pending: "正在准备制作",
+        continue_making: "返回制作会话",
+        sync_changes: "确认修改并继续制作",
+        retry_activation: "重新开始制作",
+      };
+      return labels[guidance?.next?.kind] || "继续补充工作说明";
     }
     function RunEvidencePanel({ project, onRerun, rerunning, canRerun }) {
       const cases = project.evaluation.cases;
@@ -762,10 +767,9 @@ window.__ModuleLoader__.load({
         if (!value || !nameChanged) return;
         try { await putProject(workspaceId, { projectName: value }, "projectName"); } catch {}
       };
-      const ready = activationReady(project);
-      const returnToCanonical = canonicalSessionElsewhere(project, sessionId);
-      const canReturn = returnToCanonical
-        || (Number.isInteger(project.work.activeRevision) && project.work.activeRevision === project.briefRevision);
+      const canActivate = guidanceAllowsActivation(project.guidance);
+      const returnToCanonical = guidanceReturnsToCanonical(project.guidance, project, sessionId);
+      const canReturn = returnToCanonical || project.guidance?.next?.kind === "continue_making";
       const canRerun = project.work.sessionId === sessionId
         && project.work.activeRevision === project.briefRevision
         && project.evaluation.cases.length > 0;
@@ -801,10 +805,10 @@ window.__ModuleLoader__.load({
             h("div", null, h("dt", null, "写入范围"), h("dd", null, "仅当前项目；危险操作会先询问")),
             h("div", null, h("dt", null, "计划动作"), h("dd", null, "制作最小结果 → 用真实材料运行 → 按验收标准修正")))),
         !project.readiness.ready ? h("p", { className: "wx-readiness" }, "还需明确：", project.readiness.missingRequired.map((key) => fields.find((field) => field.key === key)?.label).filter(Boolean).join("、")) : null,
-        h("button", { type: "button", className: "wx-primary wx-activate", disabled: record.busy || (!canReturn && !ready), onClick: run }, record.busy ? "正在准备…" : actionLabel(project, sessionId)),
+        h("button", { type: "button", className: "wx-primary wx-activate", disabled: record.busy || (!canReturn && !canActivate), onClick: run }, record.busy ? "正在准备…" : actionLabel(project, sessionId)),
         h("p", { className: "wx-activation-note" }, returnToCanonical
           ? "制作只在项目的主会话继续；先返回该对话，再确认并同步修改。"
-          : ready
+          : canActivate
             ? "点击后会原子确认当前工作说明，并在这个对话里开始制作。"
             : "补全四项制作条件后，可一次确认工作说明并开始制作。"));
     }
@@ -972,7 +976,7 @@ window.__ModuleLoader__.load({
     async function activateProject(ctx, workspaceId, sessionId) {
       const record = recordFor(workspaceId);
       const hadActiveContract = Number.isInteger(record.project.work.activeRevision);
-      if (!activationReady(record.project)) return replaceRecord(workspaceId, { error: "请先补全目标、真实输入、交付物和验收标准。" });
+      if (!guidanceAllowsActivation(record.project.guidance)) return replaceRecord(workspaceId, { error: "请先补全目标、真实输入、交付物和验收标准。" });
       replaceRecord(workspaceId, { busy: true, error: "", errorCode: "", conflict: false });
       try {
         await assertModelReady(ctx);
