@@ -12,6 +12,8 @@ import {
   createProxyRunProjectionDefinition,
   createProxyRunToolAdapter,
 } from './proxy-run.mjs';
+import { EvaluationProjectStore, WORKFLOW_ENTRYPOINT, WORKFLOW_MANIFEST } from './evaluation-state.mjs';
+import { RestrictedWorkflowRunner } from './restricted-runner.mjs';
 
 /** Wanxiang's product policy and browser branding, composed into every session. */
 export const name = 'wanxiang-workbench';
@@ -49,6 +51,7 @@ const makingPolicy = `You are Wanxiang, continuing the same conversation in whic
 The confirmed work description is the current contract. Work in one continuous make-and-verify loop: inspect the real materials, make the smallest useful implementation, run representative and boundary checks immediately, explain failures in plain language, and revise until there is evidence for every acceptance criterion. Code generation alone is not completion.
 
 Keep artifacts readable and versionable inside the current project. Never claim a Data Agent or external system is connected when only a sample contract exists. Preview risky writes and obtain the native approval before any external message, deletion, payment, credential use, or other irreversible side effect. The community drawer is external support, not an approval stage.`;
+const evaluationPolicy = `The editable deterministic implementation is .wanxiang/${WORKFLOW_ENTRYPOINT} with its fixed manifest at .wanxiang/${WORKFLOW_MANIFEST}. Run it through wanxiang_run_evaluation after each change. .wanxiang/evals.json is a read-only mirror of protected representative cases and expected results: never edit it to make the implementation pass.`;
 
 const DISCOVERY_TOOLS = new Set([
   'ask_user_question',
@@ -63,12 +66,15 @@ const BUILD_PRESET_CANDIDATES = ['wanxiang-build', 'workspace-write'];
 
 export function apply(ctx) {
   const dataRoot = dataRootFromEnvironment();
+  const evaluationStore = new EvaluationProjectStore({ dataRoot });
   const service = new WanxiangStateService({
     workspaceRegistry: ctx.workspaceRegistry,
     projectsRoot: absoluteRoot(process.env.WANXIANG_WORKSPACE_ROOT),
     dataRoot,
+    evaluationStore,
   });
   const runEvidenceStore = new RunEvidenceStore({ dataRoot });
+  const runner = new RestrictedWorkflowRunner();
   const authorization = createAuthorizationTracker();
   void service.prepareRoots().catch(() => {});
 
@@ -76,6 +82,8 @@ export function apply(ctx) {
   ctx.effect(() => ctx.sessionProjections.register(createProxyRunProjectionDefinition()));
   ctx.effect(() => ctx.tools.register(createProxyRunToolAdapter({
     projectService: service,
+    evaluationStore,
+    runner,
     workflowEngine: ctx.workflowEngine,
     evidenceStore: runEvidenceStore,
     flushSession: (session) => ctx.sessions.flush(session),
@@ -134,7 +142,7 @@ export function apply(ctx) {
       .filter((item) => !['wanxiang:confirmed-work-brief', 'wanxiang:work-description'].includes(item.name));
     sections.push({
       name: making ? 'wanxiang:making-policy' : 'wanxiang:discovery-policy',
-      text: making ? makingPolicy : discoveryPolicy,
+      text: making ? `${makingPolicy}\n\n${evaluationPolicy}` : discoveryPolicy,
     });
     contexts.push({
       name: 'wanxiang:work-description',

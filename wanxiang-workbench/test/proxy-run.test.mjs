@@ -112,16 +112,41 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   };
   const saved = [];
   let flushes = 0;
+  const runRequests = [];
   const tool = createProxyRunToolAdapter({
     projectService: {
       async contextForAgent(actual) {
         assert.equal(actual, agent);
-        return { workspaceId: 'project-1', state };
+        return { workspaceId: 'project-1', workspacePath: '/managed/project', state };
+      },
+    },
+    evaluationStore: {
+      async load(project) {
+        assert.deepEqual(project, { workspaceId: 'project-1', workspacePath: '/managed/project' });
+        return {
+          workflow: { workflowVersion: '2.0.0', entrypoint: 'workflow.mjs' },
+          source: 'workflow source',
+          eval: {
+            revision: 3,
+            cases: [{
+              id: PROXY_RUN_CASE_ID,
+              input: { title: '客户跟进清单' },
+              expected: { title: '客户跟进清单', itemCount: 2, labels: ['已安排', '待回复'] },
+            }],
+          },
+        };
+      },
+    },
+    runner: {
+      async run(request) {
+        runRequests.push(request);
+        return { title: '客户跟进清单', itemCount: 2, labels: ['已安排', '待回复'] };
       },
     },
     workflowEngine,
     evidenceStore: { async save(evidence) { saved.push(structuredClone(evidence)); } },
     flushSession: async (actual) => { assert.equal(actual, session); flushes += 1; },
+    createRunId: () => 'run-unique-1',
     now: sequenceClock('2026-09-02T10:00:00.000Z', '2026-09-02T10:00:01.000Z'),
   });
 
@@ -131,7 +156,7 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   assert.equal(workflowRequest.parent, agent);
   assert.equal(workflowRequest.meta.name, PROXY_RUN_WORKFLOW_NAME);
   assert.equal(workflowRequest.args.caseId, PROXY_RUN_CASE_ID);
-  assert.equal(workflowRequest.maxTotalAgents, undefined);
+  assert.equal(workflowRequest.maxTotalAgents, 1);
   assert.match(workflowRequest.script, /return \{/u);
   assert.doesNotMatch(workflowRequest.script, /readFile|import\(|require\(/u);
   assert.equal(disposed, 1);
@@ -143,8 +168,8 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
     projectId: 'project-1',
     sessionId: 'session-1',
     caseId: PROXY_RUN_CASE_ID,
-    workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
-    evalRevision: PROXY_RUN_EVAL_REVISION,
+    workflowVersion: '2.0.0',
+    evalRevision: 3,
     workBriefRevision: 7,
     startedAt: '2026-09-02T10:00:00.000Z',
   });
@@ -154,11 +179,60 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   assert.equal(saved[0].runId, 'run-unique-1');
   assert.equal(saved[0].projectId, 'project-1');
   assert.equal(saved[0].sessionId, 'session-1');
-  assert.equal(saved[0].workflowVersion, PROXY_RUN_WORKFLOW_VERSION);
-  assert.equal(saved[0].evalRevision, PROXY_RUN_EVAL_REVISION);
+  assert.equal(saved[0].workflowVersion, '2.0.0');
+  assert.equal(saved[0].evalRevision, 3);
   assert.equal(saved[0].workBriefRevision, 7);
   assert.equal(output.status, 'passed');
   assert.equal(output.runId, 'run-unique-1');
+  assert.equal(runRequests[0].entrypoint, 'workflow.mjs');
+  assert.deepEqual(runRequests[0].input, { title: '客户跟进清单' });
+});
+
+test('runner failures become structured evidence and a terminal fact in the same DSH session', async () => {
+  const currentCaseId = 'normal-case-v2';
+  const events = [];
+  const saved = [];
+  const session = { header: {}, append(type, data) { events.push({ type, data }); } };
+  const agent = { id: 'session-1', session };
+  const tool = createProxyRunToolAdapter({
+    projectService: {
+      async contextForAgent() {
+        return {
+          workspaceId: 'project-1',
+          workspacePath: '/managed/project',
+          state: { brief: { revision: 7 }, work: { sessionId: 'session-1', activeRevision: 7 } },
+        };
+      },
+    },
+    evaluationStore: {
+      async load() {
+        return {
+          workflow: { workflowVersion: '2.0.0', entrypoint: 'workflow.mjs' },
+          source: 'while (true) {}',
+          eval: { revision: 3, cases: [{ id: currentCaseId, input: {}, expected: {} }] },
+        };
+      },
+    },
+    runner: {
+      async run() { throw Object.assign(new Error('Workflow 超时。'), { code: 'workflow_timeout' }); },
+    },
+    workflowEngine: { start() { assert.fail('failed execution must not reach assertions'); } },
+    evidenceStore: { async save(value) { saved.push(value); } },
+    flushSession: async () => {},
+    createRunId: () => 'run-failed-1',
+    now: sequenceClock('2026-09-02T10:00:00.000Z', '2026-09-02T10:00:01.000Z'),
+  });
+
+  await assert.rejects(
+    tool.execute({ caseId: currentCaseId }, { agent, signal: new AbortController().signal }),
+    (error) => error.code === 'workflow_timeout',
+  );
+
+  assert.deepEqual(events.map((event) => event.type), ['tool-workflow/run-start', 'tool-workflow/run-end']);
+  assert.equal(events[1].data.status, 'failed');
+  assert.equal(events[1].data.evidence.error.code, 'workflow_timeout');
+  assert.equal(saved[0].status, 'failed');
+  assert.equal(saved[0].error.code, 'workflow_timeout');
 });
 
 test('proxy-run evidence is persisted outside project code under stable run identity', async (t) => {

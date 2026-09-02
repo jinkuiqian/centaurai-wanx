@@ -355,10 +355,11 @@ export function renderBrief({ projectName, brief }) {
 }
 
 export class WanxiangStateService {
-  constructor({ workspaceRegistry, projectsRoot, dataRoot, now = () => new Date().toISOString(), id = randomUUID }) {
+  constructor({ workspaceRegistry, projectsRoot, dataRoot, evaluationStore = null, now = () => new Date().toISOString(), id = randomUUID }) {
     this.workspaceRegistry = workspaceRegistry;
     this.projectsRoot = projectsRoot;
     this.dataRoot = dataRoot;
+    this.evaluationStore = evaluationStore;
     this.now = now;
     this.id = id;
   }
@@ -636,10 +637,14 @@ export class WanxiangStateService {
       this.id,
       this.dataRoot,
     ));
+    if (this.evaluationStore) {
+      await this.evaluationStore.load({ workspaceId: String(workspace.id), workspacePath: workspace.path });
+    }
     const preference = await this.#sessionContextValue(state, sessionId);
     const base = {
       ...preference,
       workspaceId: String(workspace.id),
+      workspacePath: workspace.path,
       state,
       projection: deriveProjectState(state),
     };

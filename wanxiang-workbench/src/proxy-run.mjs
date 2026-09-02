@@ -1,30 +1,33 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { PROXY_RUN_CASE_ID } from './evaluation-state.mjs';
 
 export const PROXY_RUN_TOOL_NAME = 'wanxiang_run_evaluation';
-export const PROXY_RUN_CASE_ID = 'preset-proxy-run-v1';
 export const PROXY_RUN_EVAL_REVISION = 1;
 export const PROXY_RUN_WORKFLOW_NAME = 'wanxiang-preset-proxy-run';
 export const PROXY_RUN_WORKFLOW_VERSION = '1.0.0';
+export { PROXY_RUN_CASE_ID };
 
-const PROXY_RUN_SCRIPT = `const stableOutput = {
-  title: args.fixture.title,
-  itemCount: args.fixture.items.length,
-  labels: args.fixture.items.map((item) => item.label).sort(),
+const PROXY_RUN_SCRIPT = `const stable = (value) => {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+  }
+  return value;
 };
 const expected = args.expected;
-const assertions = [
-  { id: "stable-title", passed: stableOutput.title === expected.title },
-  { id: "stable-count", passed: stableOutput.itemCount === expected.itemCount },
-  { id: "stable-labels", passed: JSON.stringify(stableOutput.labels) === JSON.stringify(expected.labels) },
-];
+const actual = args.actual;
+const assertions = Object.keys(expected).sort().map((key) => ({
+  id: "expected-" + key,
+  passed: JSON.stringify(stable(actual[key])) === JSON.stringify(stable(expected[key])),
+}));
 const passed = assertions.every((item) => item.passed);
 return {
   status: passed ? "passed" : "failed",
   summary: passed ? "代理运行通过" : "代理运行未通过",
   assertions,
-  output: stableOutput,
+  output: actual,
 };`;
 
 const PRESET_INPUT = Object.freeze({
@@ -112,13 +115,18 @@ export class RunEvidenceStore {
 }
 
 export function createPresetProxyRunWorkflowRequest(parent, signal) {
+  const actual = {
+    title: PRESET_INPUT.fixture.title,
+    itemCount: PRESET_INPUT.fixture.items.length,
+    labels: PRESET_INPUT.fixture.items.map((item) => item.label).sort(),
+  };
   return {
     script: PROXY_RUN_SCRIPT,
     meta: {
       name: PROXY_RUN_WORKFLOW_NAME,
       description: 'Run Wanxiang\'s deterministic preset proxy run over synthetic material.',
     },
-    args: structuredClone(PRESET_INPUT),
+    args: { caseId: PROXY_RUN_CASE_ID, actual, expected: structuredClone(PRESET_INPUT.expected) },
     parent,
     signal,
   };
@@ -126,9 +134,12 @@ export function createPresetProxyRunWorkflowRequest(parent, signal) {
 
 export function createProxyRunToolAdapter({
   projectService,
+  evaluationStore,
+  runner,
   workflowEngine,
   evidenceStore,
   flushSession,
+  createRunId = randomUUID,
   now = () => new Date().toISOString(),
 }) {
   return {
@@ -140,8 +151,7 @@ export function createProxyRunToolAdapter({
       properties: {
         caseId: {
           type: 'string',
-          enum: [PROXY_RUN_CASE_ID],
-          description: 'The preset synthetic material revision to run through the proxy slice.',
+          description: 'A representative case ID from the current confirmed acceptance revision.',
         },
       },
       required: ['caseId'],
@@ -164,8 +174,9 @@ export function createProxyRunToolAdapter({
       }),
     },
     async execute(args, execution) {
-      if (!args || args.caseId !== PROXY_RUN_CASE_ID || Object.keys(args).some((key) => key !== 'caseId')) {
-        throw proxyRunError('proxy_run_case_invalid', '只支持当前预置代理运行。', 400);
+      if (!args || typeof args.caseId !== 'string' || !args.caseId.trim()
+        || Object.keys(args).some((key) => key !== 'caseId')) {
+        throw proxyRunError('proxy_run_case_invalid', '需要指定当前验收标准中的代表案例。', 400);
       }
       const agent = execution.agent;
       const sessionId = String(agent?.id || '');
@@ -178,68 +189,125 @@ export function createProxyRunToolAdapter({
         || context.state.work?.activeRevision !== context.state.brief?.revision) {
         throw proxyRunError('proxy_run_activation_required', '请先在当前会话确认工作说明并开始制作。', 409);
       }
-
-      const run = workflowEngine.start(createPresetProxyRunWorkflowRequest(agent, execution.signal));
-      const startedAt = now();
-      const abort = () => run.cancel('parent step aborted');
-      let result;
-      try {
-        agent.session.append('tool-workflow/run-start', {
-          runId: run.id,
-          name: PROXY_RUN_WORKFLOW_NAME,
-          projectId: context.workspaceId,
-          sessionId,
-          caseId: PROXY_RUN_CASE_ID,
-          workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
-          evalRevision: PROXY_RUN_EVAL_REVISION,
-          workBriefRevision: context.state.brief.revision,
-          startedAt,
-        });
-        await flushSession(agent.session);
-        execution.signal?.addEventListener('abort', abort, { once: true });
-        result = await run.result;
-      } finally {
-        execution.signal?.removeEventListener('abort', abort);
-        await run.dispose();
+      if (!evaluationStore || !runner || !context.workspacePath) {
+        throw proxyRunError('proxy_run_configuration_invalid', '当前项目的受限评测环境尚未就绪。');
       }
-
-      const completedAt = now();
-      const value = normalizeProxyRunValue(result);
-      const evidence = {
-        runId: String(run.id),
-        projectId: String(context.workspaceId),
+      const evaluation = await evaluationStore.load({
+        workspaceId: context.workspaceId,
+        workspacePath: context.workspacePath,
+      });
+      const evalCase = evaluation.eval.cases.find((candidate) => candidate.id === args.caseId);
+      if (!evalCase) throw proxyRunError('proxy_run_case_invalid', '当前验收标准不包含这个代表案例。', 400);
+      const runId = String(createRunId());
+      const startedAt = now();
+      agent.session.append('tool-workflow/run-start', {
+        runId,
+        name: PROXY_RUN_WORKFLOW_NAME,
+        projectId: context.workspaceId,
         sessionId,
-        workflowVersion: PROXY_RUN_WORKFLOW_VERSION,
-        evalRevision: PROXY_RUN_EVAL_REVISION,
+        caseId: evalCase.id,
+        workflowVersion: evaluation.workflow.workflowVersion,
+        evalRevision: evaluation.eval.revision,
         workBriefRevision: context.state.brief.revision,
-        caseId: PROXY_RUN_CASE_ID,
-        status: value.status,
         startedAt,
-        completedAt,
-        summary: value.summary,
-        assertions: value.assertions,
-      };
-      await evidenceStore.save(evidence);
-      agent.session.append('tool-workflow/run-end', {
-        runId: run.id,
-        stopReason: result.stopReason,
-        status: evidence.status,
-        completedAt,
-        evidence: {
-          summary: evidence.summary,
-          assertions: evidence.assertions,
-        },
       });
       await flushSession(agent.session);
 
-      if (result.stopReason !== 'completed') {
-        throw proxyRunError('proxy_run_workflow_failed', result.error || '代理运行未能完成。');
+      try {
+        const actual = await runner.run({
+          workspacePath: context.workspacePath,
+          entrypoint: evaluation.workflow.entrypoint,
+          source: evaluation.source,
+          input: structuredClone(evalCase.input),
+        });
+        const request = {
+          script: PROXY_RUN_SCRIPT,
+          meta: {
+            name: PROXY_RUN_WORKFLOW_NAME,
+            description: 'Evaluate deterministic Wanxiang Workflow output against the protected acceptance revision.',
+          },
+          args: { caseId: evalCase.id, actual, expected: structuredClone(evalCase.expected) },
+          parent: agent,
+          signal: execution.signal,
+          maxTotalAgents: 1,
+        };
+        const run = workflowEngine.start(request);
+        let result;
+        try {
+          result = await run.result;
+        } finally {
+          await run.dispose();
+        }
+        const value = normalizeProxyRunValue(result);
+        const evidence = evaluationEvidence({
+          runId, context, sessionId, evaluation, evalCase, startedAt, completedAt: now(), value,
+        });
+        await recordEvaluationResult(agent.session, evidenceStore, flushSession, evidence, result.stopReason);
+        if (result.stopReason !== 'completed') {
+          throw Object.assign(proxyRunError('proxy_run_workflow_failed', result.error || '代理运行未能完成。'), { evaluationRecorded: true });
+        }
+        if (evidence.status !== 'passed') {
+          throw Object.assign(proxyRunError('proxy_run_assertion_failed', evidence.summary), { evaluationRecorded: true });
+        }
+        return evidence;
+      } catch (error) {
+        if (error?.evaluationRecorded) throw error;
+        const failure = normalizeFailure(error);
+        const evidence = evaluationEvidence({
+          runId,
+          context,
+          sessionId,
+          evaluation,
+          evalCase,
+          startedAt,
+          completedAt: now(),
+          value: { status: 'failed', summary: failure.message, assertions: [], error: failure },
+        });
+        await recordEvaluationResult(agent.session, evidenceStore, flushSession, evidence, 'error');
+        throw Object.assign(error instanceof Error ? error : new Error(failure.message), failure, { evaluationRecorded: true });
       }
-      if (evidence.status !== 'passed') {
-        throw proxyRunError('proxy_run_assertion_failed', evidence.summary);
-      }
-      return evidence;
     },
+  };
+}
+
+function evaluationEvidence({ runId, context, sessionId, evaluation, evalCase, startedAt, completedAt, value }) {
+  return {
+    runId,
+    projectId: String(context.workspaceId),
+    sessionId,
+    workflowVersion: evaluation.workflow.workflowVersion,
+    evalRevision: evaluation.eval.revision,
+    workBriefRevision: context.state.brief.revision,
+    caseId: evalCase.id,
+    status: value.status,
+    startedAt,
+    completedAt,
+    summary: value.summary,
+    assertions: value.assertions,
+    ...(value.error ? { error: value.error } : {}),
+  };
+}
+
+async function recordEvaluationResult(session, evidenceStore, flushSession, evidence, stopReason) {
+  await evidenceStore.save(evidence);
+  session.append('tool-workflow/run-end', {
+    runId: evidence.runId,
+    stopReason,
+    status: evidence.status,
+    completedAt: evidence.completedAt,
+    evidence: {
+      summary: evidence.summary,
+      assertions: evidence.assertions,
+      ...(evidence.error ? { error: evidence.error } : {}),
+    },
+  });
+  await flushSession(session);
+}
+
+function normalizeFailure(error) {
+  return {
+    code: typeof error?.code === 'string' ? error.code : 'proxy_run_workflow_failed',
+    message: error instanceof Error && error.message ? error.message : '代理运行未能完成。',
   };
 }
 
