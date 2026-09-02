@@ -21,6 +21,8 @@ export const BRIEF_FIELDS = [
 export const REQUIRED_BRIEF_FIELDS = ['goal', 'inputs', 'output', 'success'];
 export const OPTIONAL_BRIEF_FIELDS = ['examples', 'rules', 'boundaries'];
 export const FIELD_SOURCE_STATUSES = ['user_confirmed', 'inferred', 'unresolved'];
+const HIGH_RISK_ACTIONS = ['external_write', 'message', 'delete', 'payment', 'credential_use'];
+const APPROVAL_POLICY_SUMMARY = '高风险动作必须先预览并获得用户明确批准。';
 
 const feedbackImprovementState = createFeedbackImprovementState({
   briefFields: BRIEF_FIELDS,
@@ -83,6 +85,7 @@ export function createInitialState(projectName, timestamp = new Date().toISOStri
       confirmedFieldSources: null,
     },
     work: { sessionId: null, activeRevision: null, activation: null },
+    safety: initialSafety(),
     runs: initialEvaluationRuns(),
     feedback: initialRunFeedback(),
     improvements: initialFeedbackImprovements(),
@@ -101,6 +104,17 @@ function initialRunFeedback() {
 
 function initialFeedbackImprovements() {
   return { order: [], byId: {} };
+}
+
+function initialSafety() {
+  return {
+    approvalPolicy: {
+      mode: 'explicit_user_approval',
+      source: 'host_enforced',
+      highRiskActions: [...HIGH_RISK_ACTIONS],
+      summary: APPROVAL_POLICY_SUMMARY,
+    },
+  };
 }
 
 function startRunState(current, input, runtimeId) {
@@ -430,7 +444,7 @@ function guidance(state, progress, deferredFields, investigatedFields, stage, ki
   };
 }
 
-export function deriveProjectState(state) {
+export function deriveProjectState(state, evaluation = null) {
   const readiness = deriveReadiness(state);
   const guidance = deriveGuidance(state);
   const activation = state.work.activation;
@@ -439,16 +453,112 @@ export function deriveProjectState(state) {
   else if (state.work.activeRevision !== null && state.brief.revision > state.work.activeRevision) phase = 'changed';
   else if (activation?.status === 'active' && state.work.activeRevision === state.brief.revision) phase = 'making';
   else if (readiness.ready) phase = 'ready';
-  const acceptedRealRuns = new Set(state.feedback.order
-    .map((feedbackId) => state.feedback.byId[feedbackId])
-    .filter((feedback) => feedback.verdict === 'correct'
-      && state.runs.byId[feedback.runId]?.status === 'passed')
-    .map((feedback) => feedback.runId));
+  const confirmedCoreCount = REQUIRED_BRIEF_FIELDS.filter((key) => (
+    state.brief.confirmedRevision === state.brief.revision
+      && !isPlaceholder(state.brief.confirmedAnswers?.[key])
+      && state.brief.confirmedFieldSources?.[key]?.status === 'user_confirmed'
+  )).length;
+  const coreConfirmed = confirmedCoreCount === REQUIRED_BRIEF_FIELDS.length;
+  const latestFeedbackByRun = new Map();
+  for (const feedbackId of state.feedback.order) {
+    const feedback = state.feedback.byId[feedbackId];
+    latestFeedbackByRun.set(feedback.runId, feedback);
+  }
+  const currentRealRuns = state.runs.order
+    .map((runId) => state.runs.byId[runId])
+    .filter((run) => run.kind === 'real' && runMatchesCurrentVersion(run, state, evaluation));
+  const acceptedRealRuns = currentRealRuns.filter((run) => (
+    run.status === 'passed' && latestFeedbackByRun.get(run.runId)?.verdict === 'correct'
+  ));
+  let consecutiveAcceptedRealRuns = 0;
+  for (const run of [...currentRealRuns].reverse()) {
+    if (run.status !== 'passed' || latestFeedbackByRun.get(run.runId)?.verdict !== 'correct') break;
+    consecutiveAcceptedRealRuns += 1;
+  }
+  const canTry = coreConfirmed && acceptedRealRuns.length >= 1;
+  const currentEvaluationRuns = state.runs.order
+    .map((runId) => state.runs.byId[runId])
+    .filter((run) => run.kind !== 'real' && runMatchesCurrentVersion(run, state, evaluation));
+  const latestEvaluationRunByCase = new Map();
+  for (const run of currentEvaluationRuns) latestEvaluationRunByCase.set(run.caseId, run);
+  const representativeCases = Array.isArray(evaluation?.cases) ? evaluation.cases : [];
+  const passedRepresentativeCases = representativeCases.filter((evalCase) => (
+    latestEvaluationRunByCase.get(evalCase.id)?.status === 'passed'
+  ));
+  const boundaryPassed = passedRepresentativeCases.filter((evalCase) => evalCase.kind === 'boundary').length;
+  const representativeCasesSatisfied = representativeCases.length >= 5
+    && passedRepresentativeCases.length === representativeCases.length
+    && boundaryPassed >= 2;
+  const canShadow = canTry && representativeCasesSatisfied;
+  const representativeCasesMissing = Math.max(
+    5 - passedRepresentativeCases.length,
+    representativeCases.length - passedRepresentativeCases.length,
+  );
+  const boundaryCasesMissing = Math.max(2 - boundaryPassed, 0);
+  const approvalPolicy = state.safety?.approvalPolicy;
+  const approvalPolicySatisfied = approvalPolicy?.mode === 'explicit_user_approval'
+    && approvalPolicy.source === 'host_enforced'
+    && HIGH_RISK_ACTIONS.every((action) => approvalPolicy.highRiskActions?.includes(action));
+  const canUse = canShadow && consecutiveAcceptedRealRuns >= 3 && approvalPolicySatisfied;
   const maturity = {
-    stage: acceptedRealRuns.size > 0 ? 'can_try' : phase === 'making' ? 'making' : phase,
-    acceptedRealRunCount: acceptedRealRuns.size,
+    stage: canUse ? 'can_use' : canShadow ? 'can_shadow' : canTry ? 'can_try' : coreConfirmed ? 'can_make' : 'understanding',
+    label: canUse ? '可以使用' : canShadow ? '可以影子运行' : canTry ? '可以试用' : coreConfirmed ? '可以开始制作' : '理解中',
+    acceptedRealRunCount: acceptedRealRuns.length,
+    evidence: {
+      confirmedCoreFields: {
+        confirmed: confirmedCoreCount,
+        required: REQUIRED_BRIEF_FIELDS.length,
+        satisfied: coreConfirmed,
+      },
+      representativeCases: {
+        passed: passedRepresentativeCases.length,
+        total: representativeCases.length,
+        boundaryPassed,
+        boundaryRequired: 2,
+        satisfied: representativeCasesSatisfied,
+      },
+      acceptedRealRuns: {
+        total: acceptedRealRuns.length,
+        consecutive: consecutiveAcceptedRealRuns,
+        requiredForTry: 1,
+        requiredForUse: 3,
+      },
+      approvalPolicy: {
+        satisfied: approvalPolicySatisfied,
+        source: approvalPolicy?.source === 'host_enforced' ? '产品内置安全策略' : '未验证',
+        summary: approvalPolicy?.summary || '尚未记录高风险动作审批策略。',
+      },
+    },
+    next: canUse ? null : canShadow ? {
+      stage: 'can_use',
+      label: '可以使用',
+      missing: [`还需连续 ${Math.max(3 - consecutiveAcceptedRealRuns, 0)} 个当前版本的真实运行通过并得到成员接受。`],
+    } : canTry ? {
+      stage: 'can_shadow',
+      label: '可以影子运行',
+      missing: [
+        ...(representativeCasesMissing > 0
+          ? [`还需 ${representativeCasesMissing} 个当前版本的代表案例全部通过。`] : []),
+        ...(boundaryCasesMissing > 0 ? [`其中还需 ${boundaryCasesMissing} 个边界案例通过。`] : []),
+      ],
+    } : coreConfirmed ? {
+      stage: 'can_try',
+      label: '可以试用',
+      missing: ['还需 1 个当前版本的真实运行通过并得到成员接受。'],
+    } : {
+      stage: 'can_make',
+      label: '可以开始制作',
+      missing: [`还需确认 ${REQUIRED_BRIEF_FIELDS.length - confirmedCoreCount} 项核心工作条件。`],
+    },
   };
   return { phase, readiness, guidance, maturity };
+}
+
+function runMatchesCurrentVersion(run, state, evaluation) {
+  return run.workBriefRevision === state.brief.revision
+    && run.agentVersion === evaluation?.agentVersion
+    && run.workflowVersion === evaluation?.workflowVersion
+    && run.evalRevision === evaluation?.evalRevision;
 }
 
 export function reserveActivation(current, request, timestamp = new Date().toISOString(), id = randomUUID()) {
@@ -1551,15 +1661,15 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
   if (state?.schemaVersion === 2) {
     if (Object.hasOwn(state.brief || {}, 'confirmedAnswers')
       && Object.hasOwn(state.brief || {}, 'confirmedFieldSources')) {
-      return validateV2State(releaseFailedActivationSession(withFeedbackImprovements(withGuidanceMetadata(
+      return validateV2State(withSafetyPolicy(releaseFailedActivationSession(withFeedbackImprovements(withGuidanceMetadata(
         withRunFeedback(Object.hasOwn(state, 'runs') ? state : { ...state, runs: initialEvaluationRuns() }),
-      ))));
+      )))));
     }
     const confirmedAnswers = state.brief?.confirmedRevision === null
       ? null
       : (state.brief.confirmedRevision === state.brief.revision ? state.brief.answers : recoveredAnswers);
     const confirmedFieldSources = confirmedAnswers ? cloneFieldSources(state.brief.fieldSources) : null;
-    return validateV2State(releaseFailedActivationSession(withFeedbackImprovements(withGuidanceMetadata(withRunFeedback({
+    return validateV2State(withSafetyPolicy(releaseFailedActivationSession(withFeedbackImprovements(withGuidanceMetadata(withRunFeedback({
       ...state,
       brief: {
         ...state.brief,
@@ -1567,7 +1677,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
         confirmedAnswers: confirmedAnswers ? { ...confirmedAnswers } : null,
         confirmedFieldSources,
       },
-    })))));
+    }))))));
   }
   validateV1State(state);
   const answers = Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, key === 'examples' ? '' : state.brief.answers[key]]));
@@ -1622,6 +1732,7 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
       activeRevision: activation?.status === 'active' ? activation.briefRevision : null,
       activation,
     },
+    safety: initialSafety(),
     runs: initialEvaluationRuns(),
     feedback: initialRunFeedback(),
     improvements: initialFeedbackImprovements(),
@@ -1632,6 +1743,10 @@ export function migrateProjectState(state, { confirmedAnswers: recoveredAnswers 
 
 function withRunFeedback(state) {
   return Object.hasOwn(state, 'feedback') ? state : { ...state, feedback: initialRunFeedback() };
+}
+
+function withSafetyPolicy(state) {
+  return Object.hasOwn(state, 'safety') ? state : { ...state, safety: initialSafety() };
 }
 
 function withFeedbackImprovements(state) {
@@ -1695,6 +1810,7 @@ function validateV1State(state) {
 function validateV2State(state) {
   if (!state || state.schemaVersion !== 2 || !Number.isInteger(state.stateVersion) || state.stateVersion < 1
     || typeof state.projectName !== 'string' || !state.projectName.trim() || !state.brief || !state.work
+    || !isSafetyPolicy(state.safety)
     || !isRuns(state.runs) || !isRunFeedbackStore(state.feedback, state.runs)
     || !feedbackImprovementState.isStore(state.improvements, state.feedback, state.runs)
     || !Number.isInteger(state.brief.revision) || state.brief.revision < 0
@@ -1752,6 +1868,20 @@ function validateV2State(state) {
     throw corruptState();
   }
   return state;
+}
+
+function isSafetyPolicy(value) {
+  const policy = value?.approvalPolicy;
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 1
+    && policy && typeof policy === 'object' && !Array.isArray(policy)
+    && Object.keys(policy).every((key) => ['mode', 'source', 'highRiskActions', 'summary'].includes(key))
+    && policy.mode === 'explicit_user_approval'
+    && policy.source === 'host_enforced'
+    && Array.isArray(policy.highRiskActions)
+    && new Set(policy.highRiskActions).size === policy.highRiskActions.length
+    && HIGH_RISK_ACTIONS.every((action) => policy.highRiskActions.includes(action))
+    && typeof policy.summary === 'string' && policy.summary;
 }
 
 function isValidFieldKeyList(value) {

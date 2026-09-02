@@ -20,6 +20,7 @@ import {
   reserveDispatch,
   updateProjectState,
 } from '../src/project-state.mjs';
+import { createProjectResponse } from '../src/policy.mjs';
 
 const completeAnswers = () => Object.fromEntries(BRIEF_FIELDS.map(([key]) => [key, `${key} answer`]));
 
@@ -70,6 +71,14 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
   assert.deepEqual(Object.keys(state.brief.answers), BRIEF_FIELDS.map(([key]) => key));
   assert.deepEqual(Object.keys(state.brief.fieldSources), BRIEF_FIELDS.map(([key]) => key));
   assert.deepEqual(state.work, { sessionId: null, activeRevision: null, activation: null });
+  assert.deepEqual(state.safety, {
+    approvalPolicy: {
+      mode: 'explicit_user_approval',
+      source: 'host_enforced',
+      highRiskActions: ['external_write', 'message', 'delete', 'payment', 'credential_use'],
+      summary: '高风险动作必须先预览并获得用户明确批准。',
+    },
+  });
   assert.deepEqual(deriveProjectState(state), {
     phase: 'understanding',
     readiness: {
@@ -115,8 +124,208 @@ test('initial v2 state exposes seven fields, provenance and derived readiness', 
         prompt: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
       },
     },
-    maturity: { stage: 'understanding', acceptedRealRunCount: 0 },
+    maturity: {
+      stage: 'understanding',
+      label: '理解中',
+      acceptedRealRunCount: 0,
+      evidence: {
+        confirmedCoreFields: { confirmed: 0, required: 4, satisfied: false },
+        representativeCases: { passed: 0, total: 0, boundaryPassed: 0, boundaryRequired: 2, satisfied: false },
+        acceptedRealRuns: { total: 0, consecutive: 0, requiredForTry: 1, requiredForUse: 3 },
+        approvalPolicy: { satisfied: true, source: '产品内置安全策略', summary: '高风险动作必须先预览并获得用户明确批准。' },
+      },
+      next: {
+        stage: 'can_make',
+        label: '可以开始制作',
+        missing: ['还需确认 4 项核心工作条件。'],
+      },
+    },
   });
+});
+
+test('four confirmed core conditions deterministically unlock making and explain the next gate', () => {
+  let state = createInitialState('客户周报', '2026-01-01T00:00:00.000Z');
+  state = updateProjectState(state, {
+    answers: Object.fromEntries(REQUIRED_BRIEF_FIELDS.map((key) => [key, `${key} answer`])),
+  });
+  state = confirmProjectState(state, state.brief.revision);
+
+  assert.deepEqual(deriveProjectState(state).maturity, {
+    stage: 'can_make',
+    label: '可以开始制作',
+    acceptedRealRunCount: 0,
+    evidence: {
+      confirmedCoreFields: { confirmed: 4, required: 4, satisfied: true },
+      representativeCases: { passed: 0, total: 0, boundaryPassed: 0, boundaryRequired: 2, satisfied: false },
+      acceptedRealRuns: { total: 0, consecutive: 0, requiredForTry: 1, requiredForUse: 3 },
+      approvalPolicy: { satisfied: true, source: '产品内置安全策略', summary: '高风险动作必须先预览并获得用户明确批准。' },
+    },
+    next: {
+      stage: 'can_try',
+      label: '可以试用',
+      missing: ['还需 1 个当前版本的真实运行通过并得到成员接受。'],
+    },
+  });
+});
+
+test('five current representative cases including two boundaries unlock shadow running', () => {
+  let state = createInitialState('客户周报', '2026-01-01T00:00:00.000Z');
+  state = updateProjectState(state, { answers: completeAnswers() });
+  state = confirmProjectState(state, state.brief.revision);
+  const cases = [
+    { id: 'case-1', title: '正常一', kind: 'normal' },
+    { id: 'case-2', title: '正常二', kind: 'normal' },
+    { id: 'case-3', title: '正常三', kind: 'normal' },
+    { id: 'case-4', title: '边界一', kind: 'boundary' },
+    { id: 'case-5', title: '边界二', kind: 'boundary' },
+  ];
+  const evaluation = {
+    agentVersion: '2.0.0', workflowVersion: '2.0.0', evalRevision: 3, cases,
+  };
+  const runs = [...cases.map((evalCase, index) => ({
+    runId: `run-eval-${index + 1}`,
+    sessionId: 'session-1',
+    caseId: evalCase.id,
+    kind: 'evaluation',
+    agentVersion: '2.0.0',
+    workflowVersion: '2.0.0',
+    evalRevision: 3,
+    workBriefRevision: state.brief.revision,
+    retryOf: null,
+    startedAt: `2026-01-01T00:00:0${index}.000Z`,
+    completedAt: `2026-01-01T00:00:1${index}.000Z`,
+    status: 'passed', conclusion: 'passed', evidence: {},
+  })), {
+    runId: 'run-real-1', sessionId: 'session-1', caseId: 'real-1', caseTitle: '真实案例', kind: 'real',
+    input: {}, agentVersion: '2.0.0', workflowVersion: '2.0.0', evalRevision: 3,
+    workBriefRevision: state.brief.revision, retryOf: null,
+    startedAt: '2026-01-01T00:01:00.000Z', completedAt: '2026-01-01T00:01:01.000Z',
+    status: 'passed', conclusion: 'passed', evidence: {},
+  }];
+  state.runs = {
+    latestRunId: 'run-real-1',
+    order: runs.map(({ runId }) => runId),
+    byId: Object.fromEntries(runs.map((run) => [run.runId, run])),
+  };
+  state.feedback = {
+    order: ['feedback-1'],
+    byId: {
+      'feedback-1': {
+        id: 'feedback-1', workspaceId: 'workspace-1', runId: 'run-real-1', caseId: 'real-1',
+        verdict: 'correct', note: '', workBriefRevision: state.brief.revision,
+        agentVersion: '2.0.0', createdAt: '2026-01-01T00:01:02.000Z',
+      },
+    },
+  };
+
+  assert.deepEqual(deriveProjectState(state, evaluation).maturity, {
+    stage: 'can_shadow',
+    label: '可以影子运行',
+    acceptedRealRunCount: 1,
+    evidence: {
+      confirmedCoreFields: { confirmed: 4, required: 4, satisfied: true },
+      representativeCases: { passed: 5, total: 5, boundaryPassed: 2, boundaryRequired: 2, satisfied: true },
+      acceptedRealRuns: { total: 1, consecutive: 1, requiredForTry: 1, requiredForUse: 3 },
+      approvalPolicy: { satisfied: true, source: '产品内置安全策略', summary: '高风险动作必须先预览并获得用户明确批准。' },
+    },
+    next: {
+      stage: 'can_use',
+      label: '可以使用',
+      missing: ['还需连续 2 个当前版本的真实运行通过并得到成员接受。'],
+    },
+  });
+
+  const latestFailure = {
+    ...runs[0],
+    runId: 'run-eval-1-failed',
+    status: 'failed',
+    conclusion: 'failed',
+    startedAt: '2026-01-01T00:02:00.000Z',
+    completedAt: '2026-01-01T00:02:01.000Z',
+  };
+  state.runs.order.push(latestFailure.runId);
+  state.runs.byId[latestFailure.runId] = latestFailure;
+  state.runs.latestRunId = latestFailure.runId;
+  const afterFailure = deriveProjectState(state, evaluation).maturity;
+  assert.equal(afterFailure.stage, 'can_try');
+  assert.equal(afterFailure.evidence.representativeCases.passed, 4);
+});
+
+test('three consecutive accepted current real runs plus the host approval policy unlock use', () => {
+  let state = createInitialState('客户周报', '2026-01-01T00:00:00.000Z');
+  state = updateProjectState(state, { answers: completeAnswers() });
+  state = confirmProjectState(state, state.brief.revision);
+  const cases = Array.from({ length: 5 }, (_, index) => ({
+    id: `case-${index + 1}`,
+    title: `案例 ${index + 1}`,
+    kind: index >= 3 ? 'boundary' : 'normal',
+  }));
+  const evaluation = {
+    agentVersion: '3.0.0', workflowVersion: '3.0.0', evalRevision: 5, cases,
+  };
+  const evaluationRuns = cases.map((evalCase, index) => ({
+    runId: `run-eval-${index + 1}`, sessionId: 'session-1', caseId: evalCase.id,
+    kind: 'evaluation', agentVersion: '3.0.0', workflowVersion: '3.0.0', evalRevision: 5,
+    workBriefRevision: state.brief.revision, retryOf: null,
+    startedAt: `2026-01-01T00:00:0${index}.000Z`, completedAt: `2026-01-01T00:00:1${index}.000Z`,
+    status: 'passed', conclusion: 'passed', evidence: {},
+  }));
+  const realRuns = Array.from({ length: 3 }, (_, index) => ({
+    runId: `run-real-${index + 1}`, sessionId: 'session-1', caseId: `real-${index + 1}`,
+    caseTitle: `真实案例 ${index + 1}`, kind: 'real', input: {},
+    agentVersion: '3.0.0', workflowVersion: '3.0.0', evalRevision: 5,
+    workBriefRevision: state.brief.revision, retryOf: null,
+    startedAt: `2026-01-01T00:01:0${index}.000Z`, completedAt: `2026-01-01T00:01:1${index}.000Z`,
+    status: 'passed', conclusion: 'passed', evidence: {},
+  }));
+  const runs = [...evaluationRuns, ...realRuns];
+  state.runs = {
+    latestRunId: 'run-real-3',
+    order: runs.map(({ runId }) => runId),
+    byId: Object.fromEntries(runs.map((run) => [run.runId, run])),
+  };
+  const feedback = realRuns.map((run, index) => ({
+    id: `feedback-${index + 1}`, workspaceId: 'workspace-1', runId: run.runId,
+    caseId: run.caseId, verdict: 'correct', note: '', workBriefRevision: state.brief.revision,
+    agentVersion: '3.0.0', createdAt: `2026-01-01T00:02:0${index}.000Z`,
+  }));
+  state.feedback = {
+    order: feedback.map(({ id }) => id),
+    byId: Object.fromEntries(feedback.map((item) => [item.id, item])),
+  };
+
+  const maturity = deriveProjectState(state, evaluation).maturity;
+
+  assert.equal(maturity.stage, 'can_use');
+  assert.equal(maturity.label, '可以使用');
+  assert.equal(maturity.acceptedRealRunCount, 3);
+  assert.equal(maturity.evidence.acceptedRealRuns.consecutive, 3);
+  assert.equal(maturity.evidence.approvalPolicy.satisfied, true);
+  assert.equal(maturity.next, null);
+
+  const afterAgentChange = deriveProjectState(state, {
+    ...evaluation, agentVersion: '3.0.1', workflowVersion: '3.0.1',
+  }).maturity;
+  assert.equal(afterAgentChange.stage, 'can_make');
+  assert.equal(afterAgentChange.acceptedRealRunCount, 0);
+
+  const afterBriefChange = updateProjectState(state, { answers: { output: '新版输出' } });
+  assert.equal(deriveProjectState(afterBriefChange, evaluation).maturity.stage, 'understanding');
+
+  const unacceptedRun = {
+    ...realRuns[2],
+    runId: 'run-real-4',
+    caseId: 'real-4',
+    caseTitle: '真实案例 4',
+    startedAt: '2026-01-01T00:03:00.000Z',
+    completedAt: '2026-01-01T00:03:01.000Z',
+  };
+  state.runs.order.push(unacceptedRun.runId);
+  state.runs.byId[unacceptedRun.runId] = unacceptedRun;
+  state.runs.latestRunId = unacceptedRun.runId;
+  const afterBrokenSequence = deriveProjectState(state, evaluation).maturity;
+  assert.equal(afterBrokenSequence.stage, 'can_shadow');
+  assert.equal(afterBrokenSequence.evidence.acceptedRealRuns.consecutive, 0);
 });
 
 test('guidance snapshot owns the current understanding, latest changes and one next action', () => {
@@ -1051,6 +1260,11 @@ test('a real case and its member feedback stay immutable, survive restart and un
   const workspace = { id: 'workspace-real-case', path: root, title: '项目', sessionIds: ['session-1'] };
   const registry = registryFor(workspace);
   const service = serviceFor(registry, { dataRoot, runtimeId: 'runtime-1' });
+  let prepared = await service.getProject(workspace.id);
+  prepared = await service.updateProject(workspace.id, prepared.stateVersion, { answers: completeAnswers() });
+  prepared = await service.confirmProject(
+    workspace.id, prepared.stateVersion, prepared.brief.revision,
+  );
   const started = await service.startRealWorkRun(workspace.id, {
     runId: 'run-real-1',
     sessionId: 'session-1',
@@ -1059,7 +1273,7 @@ test('a real case and its member feedback stay immutable, survive restart and un
     agentVersion: '1.2.0',
     workflowVersion: '1.2.0',
     evalRevision: 4,
-    workBriefRevision: 3,
+    workBriefRevision: prepared.brief.revision,
     input: { transcript: '客户希望下周安排回访。' },
     retryOf: null,
     startedAt: '2026-09-02T10:00:00.000Z',
@@ -1095,11 +1309,47 @@ test('a real case and its member feedback stay immutable, survive restart and un
     caseId: 'real-case-1',
     verdict: 'correct',
     note: '结果可以直接使用。',
-    workBriefRevision: 3,
+    workBriefRevision: prepared.brief.revision,
     agentVersion: '1.2.0',
     createdAt: '<timestamp>',
   });
-  assert.equal(deriveProjectState(withFeedback).maturity.stage, 'can_try');
+  const evaluation = {
+    agentVersion: '1.2.0', workflowVersion: '1.2.0', evalRevision: 4, cases: [],
+  };
+  assert.deepEqual(deriveProjectState(withFeedback, evaluation).maturity, {
+    stage: 'can_try',
+    label: '可以试用',
+    acceptedRealRunCount: 1,
+    evidence: {
+      confirmedCoreFields: { confirmed: 4, required: 4, satisfied: true },
+      representativeCases: { passed: 0, total: 0, boundaryPassed: 0, boundaryRequired: 2, satisfied: false },
+      acceptedRealRuns: { total: 1, consecutive: 1, requiredForTry: 1, requiredForUse: 3 },
+      approvalPolicy: { satisfied: true, source: '产品内置安全策略', summary: '高风险动作必须先预览并获得用户明确批准。' },
+    },
+    next: {
+      stage: 'can_shadow',
+      label: '可以影子运行',
+      missing: ['还需 5 个当前版本的代表案例全部通过。', '其中还需 2 个边界案例通过。'],
+    },
+  });
+
+  const evaluationStore = {
+    async load() {
+      return {
+        agent: { agentVersion: evaluation.agentVersion },
+        workflow: { workflowVersion: evaluation.workflowVersion },
+        eval: { revision: evaluation.evalRevision, cases: [] },
+      };
+    },
+  };
+  const restartedAfterAcceptance = serviceFor(registry, {
+    dataRoot, evaluationStore, runtimeId: 'runtime-after-acceptance',
+  });
+  const persistedEvidence = await restartedAfterAcceptance.getProjectEvidence(workspace.id);
+  const refreshedResponse = createProjectResponse(persistedEvidence.state, {
+    evaluation: persistedEvidence.evaluation,
+  });
+  assert.deepEqual(refreshedResponse.projection.maturity, deriveProjectState(withFeedback, evaluation).maturity);
 
   const needsChanges = await service.recordRunFeedback(workspace.id, withFeedback.stateVersion, {
     runId: 'run-real-1', verdict: 'needs_changes', note: '还要补充负责人。',
@@ -1119,7 +1369,8 @@ test('a real case and its member feedback stay immutable, survive restart and un
   const recovered = await restarted.getProject(workspace.id);
   assert.deepEqual(recovered.runs.byId['run-real-1'], historicalRun);
   assert.deepEqual(recovered.feedback, withAllFeedback.feedback);
-  assert.equal(deriveProjectState(recovered).maturity.stage, 'can_try');
+  assert.equal(deriveProjectState(recovered, evaluation).maturity.stage, 'understanding');
+  assert.equal(deriveProjectState(recovered, evaluation).maturity.acceptedRealRunCount, 0);
 });
 
 test('a correct verdict on a failed real run does not unlock tryout', async (t) => {

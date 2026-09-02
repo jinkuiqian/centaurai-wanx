@@ -475,6 +475,25 @@ test('project reads, refreshes and work-description updates share one authoritat
   ]);
 });
 
+test('project responses derive maturity from the current protected evaluation', () => {
+  const state = createInitialState('客户周报');
+  const evaluation = {
+    agentVersion: '1.0.0',
+    workflowVersion: '1.0.0',
+    evalRevision: 2,
+    cases: [
+      { id: 'case-1', title: '正常案例', kind: 'normal' },
+      { id: 'case-2', title: '边界案例', kind: 'boundary' },
+    ],
+  };
+
+  const response = createProjectResponse(state, { evaluation });
+
+  assert.equal(response.projection.maturity.evidence.representativeCases.total, 2);
+  assert.equal(response.projection.maturity.evidence.representativeCases.boundaryRequired, 2);
+  assert.equal(response.evaluation, evaluation);
+});
+
 test('work-description prompt exposes one deterministic read-only investigation action and response discipline', () => {
   let state = createInitialState('客户周报');
   state = updateProjectState(state, {

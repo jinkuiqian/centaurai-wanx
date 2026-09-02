@@ -58,7 +58,22 @@ test('v0.3 state contract survives understand-to-make in one canonical session',
         prompt: '请用一个最近真实发生的例子告诉我：你最终希望这项工作产出什么结果？',
       },
     },
-    maturity: { stage: 'understanding', acceptedRealRunCount: 0 },
+    maturity: {
+      stage: 'understanding',
+      label: '理解中',
+      acceptedRealRunCount: 0,
+      evidence: {
+        confirmedCoreFields: { confirmed: 0, required: 4, satisfied: false },
+        representativeCases: { passed: 0, total: 0, boundaryPassed: 0, boundaryRequired: 2, satisfied: false },
+        acceptedRealRuns: { total: 0, consecutive: 0, requiredForTry: 1, requiredForUse: 3 },
+        approvalPolicy: { satisfied: true, source: '产品内置安全策略', summary: '高风险动作必须先预览并获得用户明确批准。' },
+      },
+      next: {
+        stage: 'can_make',
+        label: '可以开始制作',
+        missing: ['还需确认 4 项核心工作条件。'],
+      },
+    },
   });
 
   for (const [index, key] of ANSWER_KEYS.entries()) {
@@ -184,6 +199,7 @@ function assertStateContract(state, expected) {
     'improvements',
     'projectName',
     'runs',
+    'safety',
     'schemaVersion',
     'stateVersion',
     'updatedAt',
@@ -197,6 +213,14 @@ function assertStateContract(state, expected) {
   assert.deepEqual(state.runs, { latestRunId: null, order: [], byId: {} });
   assert.deepEqual(state.feedback, { order: [], byId: {} });
   assert.deepEqual(state.improvements, { order: [], byId: {} });
+  assert.deepEqual(state.safety, {
+    approvalPolicy: {
+      mode: 'explicit_user_approval',
+      source: 'host_enforced',
+      highRiskActions: ['external_write', 'message', 'delete', 'payment', 'credential_use'],
+      summary: '高风险动作必须先预览并获得用户明确批准。',
+    },
+  });
   assert.deepEqual(Object.keys(state.brief).sort(), [
     'answers',
     'confirmedAnswers',

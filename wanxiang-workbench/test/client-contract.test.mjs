@@ -115,6 +115,29 @@ test('v0.3.8 turns corrective feedback into a same-session revision loop and kee
   assert.match(client, /feedback\.verdict !== "correct"[\s\S]*继续处理这条反馈/u);
 });
 
+test('v0.3.9 explains the evidence-backed maturity stage and the next missing evidence', () => {
+  assert.match(client, /function MaturityPanel\(\{ maturity \}\)/u);
+  assert.match(client, /maturity\.evidence\.confirmedCoreFields/u);
+  assert.match(client, /maturity\.evidence\.representativeCases/u);
+  assert.match(client, /maturity\.evidence\.acceptedRealRuns/u);
+  assert.match(client, /maturity\.evidence\.approvalPolicy/u);
+  assert.match(client, /approval\.source/u);
+  assert.match(client, /maturity\.next\?\.missing/u);
+  for (const copy of ['当前阶段', '成立依据', '下一阶段']) {
+    assert.match(client, new RegExp(copy, 'u'));
+  }
+  assert.match(client, /maturity\.label/u);
+  assert.match(client, /maturity\.next\.label/u);
+  assert.doesNotMatch(client, /const stageLabels/u);
+  assert.match(client, /h\(MaturityPanel, \{ maturity: project\.maturity \}\)/u);
+});
+
+test('an active build keeps its operational phase visible ahead of maturity', () => {
+  const makingCheck = 'if (record.project.phase === "making") return `制作中 · v${record.project.work.activeRevision}`;';
+  const maturityCheck = 'if (["can_make", "can_try", "can_shadow", "can_use"].includes(record.project.maturity?.stage)) {';
+  assert.ok(client.indexOf(makingCheck) < client.indexOf(maturityCheck));
+});
+
 test('v0.3.1 makes guidance persistent without replacing or submitting the native composer', () => {
   assert.match(client, /function GuidanceDock\(\{ session, sessionId, input, inputActions \}\)/u);
   assert.match(client, /inputActions\.setDraft\(example\.draft\)/u);

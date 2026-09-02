@@ -1023,7 +1023,7 @@ export function createPublicWebFetchTool(web) {
 }
 
 export function createProjectResponse(state, extra = {}) {
-  const projection = deriveProjectState(state);
+  const projection = deriveProjectState(state, extra.evaluation);
   return { ok: true, ...extra, state, projection, guidance: projection.guidance };
 }
 
