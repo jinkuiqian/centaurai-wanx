@@ -378,6 +378,75 @@ test('DSH start fact persistence failure finalizes the protected project run wit
   ]);
 });
 
+test('DSH terminal fact persistence failure does not rewrite an already finalized run', async () => {
+  const caseId = 'normal-case-v2';
+  const events = [];
+  let evidenceSaves = 0;
+  let projectFinishes = 0;
+  let flushes = 0;
+  const session = { header: {}, append(type, data) { events.push({ type, data: structuredClone(data) }); } };
+  const agent = { id: 'session-1', session };
+  const tool = createProxyRunToolAdapter({
+    projectService: {
+      async contextForAgent() {
+        return {
+          workspaceId: 'project-1', workspacePath: '/managed/project',
+          state: { brief: { revision: 7 }, work: { sessionId: 'session-1', activeRevision: 7 } },
+        };
+      },
+      async startEvaluationRun() {},
+      async finishEvaluationRun() { projectFinishes += 1; },
+    },
+    evaluationStore: {
+      async load() {
+        return {
+          workflow: { workflowVersion: '2.0.0', entrypoint: 'workflow.mjs' }, source: 'source',
+          eval: { revision: 3, cases: [{ id: caseId, input: {}, expected: {} }] },
+        };
+      },
+    },
+    runner: { async run() { return { reportMarkdown: '# 报告', missingFollowUps: [] }; } },
+    workflowEngine: {
+      start() {
+        return {
+          result: Promise.resolve({
+            value: {
+              status: 'passed', summary: '代理运行通过',
+              assertions: [{ id: 'stable-output', passed: true }], output: { reportMarkdown: '# 报告' },
+            },
+            stopReason: 'completed',
+          }),
+          async dispose() {},
+        };
+      },
+    },
+    evidenceStore: {
+      async save() {
+        evidenceSaves += 1;
+        if (evidenceSaves > 1) {
+          throw Object.assign(new Error('run evidence already exists'), { code: 'evaluation_run_id_conflict' });
+        }
+      },
+    },
+    flushSession: async () => {
+      flushes += 1;
+      if (flushes === 2) throw Object.assign(new Error('DSH terminal flush failed'), { code: 'session_flush_failed' });
+    },
+    createRunId: () => 'run-terminal-flush-failed-1',
+    now: sequenceClock('2026-09-02T10:00:00.000Z', '2026-09-02T10:00:01.000Z'),
+  });
+
+  await assert.rejects(
+    tool.execute({ caseId }, { agent, signal: new AbortController().signal }),
+    (error) => error.code === 'session_flush_failed' && error.evaluationRecorded === true,
+  );
+
+  assert.equal(evidenceSaves, 1);
+  assert.equal(projectFinishes, 1);
+  assert.equal(flushes, 2);
+  assert.deepEqual(events.map((event) => event.type), ['tool-workflow/run-start', 'tool-workflow/run-end']);
+});
+
 test('runner failures become structured evidence and a terminal fact in the same DSH session', async () => {
   const currentCaseId = 'normal-case-v2';
   const events = [];

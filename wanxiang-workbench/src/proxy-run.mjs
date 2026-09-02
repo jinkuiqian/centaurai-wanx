@@ -371,8 +371,15 @@ async function recordEvaluationResult(session, evidenceStore, projectService, fl
     evidence: eventEvidence,
   };
   await projectService.finishEvaluationRun(evidence.projectId, terminal);
-  session.append('tool-workflow/run-end', { ...terminal, stopReason });
-  await flushSession(session);
+  try {
+    session.append('tool-workflow/run-end', { ...terminal, stopReason });
+    await flushSession(session);
+  } catch (error) {
+    const persistenceError = error instanceof Error
+      ? error
+      : proxyRunError('proxy_run_session_persistence_failed', 'DSH 会话未能持久化代理运行结论。');
+    throw Object.assign(persistenceError, { evaluationRecorded: true });
+  }
 }
 
 function normalizeFailure(error, signal) {
