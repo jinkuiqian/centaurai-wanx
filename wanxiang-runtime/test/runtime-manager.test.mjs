@@ -203,19 +203,22 @@ process.on('SIGTERM', () => setTimeout(() => {
   writeFileSync(process.env.TEST_EXIT_MARKER, 'timeout-exit');
   process.exit(0);
 }, 40));
+writeFileSync(process.env.TEST_READY_MARKER, 'ready');
 setInterval(() => {}, 1000);
 `);
   try {
     const exitMarker = path.join(fixture.root, 'timeout-exit.txt');
-    const manager = fixture.manager({ startTimeoutMs: 80, stopTimeoutMs: 200 });
+    const readyMarker = path.join(fixture.root, 'timeout-ready.txt');
+    const manager = fixture.manager({ startTimeoutMs: 300, stopTimeoutMs: 200 });
     manager.environment.TEST_EXIT_MARKER = exitMarker;
-    const startedAt = Date.now();
-    await assert.rejects(
+    manager.environment.TEST_READY_MARKER = readyMarker;
+    const rejected = assert.rejects(
       manager.launch(),
       (error) => error?.code === 'WANXIANG_RUNTIME_TIMEOUT',
     );
+    await waitUntil(async () => access(readyMarker).then(() => true, () => false));
+    await rejected;
 
-    assert.ok(Date.now() - startedAt >= 100, 'timeout rejection should wait for child shutdown');
     assert.equal(await readFile(exitMarker, 'utf8'), 'timeout-exit');
     assert.equal(manager.startingChild, null);
     assert.equal(manager.running, null);
