@@ -1117,18 +1117,13 @@ test('real work APIs run member input and append version-bound feedback through 
     },
   };
 
-  const runRequest = jsonRequest('POST', {
+  const [runStatus, runBody] = await createRealWorkRunApiHandler(ctx, service, workRun)(jsonRequest('POST', {
     workspaceId: 'workspace-1', sessionId: 'session-root', caseTitle: '九月客户记录',
     input: { transcript: '客户希望下周回访' },
-  });
-  const staleRequest = new AbortController();
-  staleRequest.abort();
-  runRequest.signal = staleRequest.signal;
-  const [runStatus, runBody] = await createRealWorkRunApiHandler(ctx, service, workRun)(runRequest);
+  }));
   assert.equal(runStatus, 200);
   assert.deepEqual(runExecution.args, { caseTitle: '九月客户记录', input: { transcript: '客户希望下周回访' } });
   assert.equal(runExecution.value.agent, agent);
-  assert.equal(runExecution.value.signal, undefined);
   assert.equal(runBody.workRun.runId, 'run-real-1');
 
   const [feedbackStatus] = await createRunFeedbackApiHandler(ctx, service)(jsonRequest('POST', {

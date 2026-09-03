@@ -67,9 +67,6 @@ async function startFixedModel(script) {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    if (JSON.stringify(body.messages).includes('开始制作工作说明')) {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
     const chunk = fixedModelReply(body, script);
     response.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',

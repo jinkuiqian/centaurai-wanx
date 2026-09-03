@@ -557,8 +557,7 @@ export function createRealWorkRunApiHandler(ctx, service, workRun) {
     if (typeof workRun?.execute !== 'function') {
       throw serviceError(503, 'work_run_unavailable', '影子运行环境尚未就绪。');
     }
-    const signal = request.signal?.aborted ? undefined : request.signal;
-    const run = await workRun.execute({ caseTitle, input }, { agent, signal });
+    const run = await workRun.execute({ caseTitle, input }, { agent, signal: request.signal });
     const snapshot = await service.getProjectEvidence(workspaceId);
     return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation, workRun: run })];
   };

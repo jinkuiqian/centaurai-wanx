@@ -201,7 +201,11 @@ test('proxy-run tool adapter executes one deterministic synthetic case outside t
   const agent = { id: 'session-1', session };
   const state = {
     brief: { revision: 7 },
-    work: { sessionId: 'session-1', activeRevision: 7 },
+    work: {
+      sessionId: 'session-1',
+      activeRevision: null,
+      activation: { status: 'pending', briefRevision: 7 },
+    },
   };
   let workflowRequest;
   let disposed = 0;
