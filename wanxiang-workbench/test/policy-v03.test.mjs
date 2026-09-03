@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -21,6 +22,7 @@ import {
   evaluationPolicy,
   inject,
   renderPromptWorkDescription,
+  registerApi,
   terminalRunMatchesEvidence,
 } from '../src/policy.mjs';
 import { createInitialState, deriveProjectState, serviceError, updateProjectState } from '../src/project-state.mjs';
@@ -65,6 +67,47 @@ test('workbench composition registers separate proxy and real-run DSH projection
   assert.equal(registeredTools.get('wanxiang_generate_work_agent')?.name, 'wanxiang_generate_work_agent');
   assert.equal(projections.get('wanxiang.proxy-run')?.stateVersion, 3);
   assert.equal(projections.get('wanxiang.work-run')?.stateVersion, 1);
+});
+
+test('HTTP route operation signal only aborts for an unfinished disconnected response', async () => {
+  const routes = new Map();
+  const ctx = {
+    effect(effect) { return effect(); },
+    webServer: {
+      register(route) {
+        routes.set(route.path, route);
+        return () => routes.delete(route.path);
+      },
+    },
+  };
+  const request = { headers: {}, method: 'POST' };
+
+  let completedSignal;
+  registerApi(ctx, '/completed', async (_request, signal) => {
+    completedSignal = signal;
+    return [200, { ok: true }];
+  });
+  const completedResponse = responseFixture();
+  await routes.get('/completed').handler(request, completedResponse);
+  assert.equal(completedSignal.aborted, false);
+  assert.equal(completedResponse.listenerCount('close'), 0);
+
+  let disconnectedSignal;
+  let notifyStarted;
+  const started = new Promise((resolve) => { notifyStarted = resolve; });
+  registerApi(ctx, '/disconnected', async (_request, signal) => {
+    disconnectedSignal = signal;
+    notifyStarted();
+    await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+    return [499, { ok: false }];
+  });
+  const disconnectedResponse = responseFixture();
+  const handling = routes.get('/disconnected').handler(request, disconnectedResponse);
+  await started;
+  disconnectedResponse.emit('close');
+  await handling;
+  assert.equal(disconnectedSignal.aborted, true);
+  assert.equal(disconnectedResponse.listenerCount('close'), 0);
 });
 
 test('pending evidence recovery only accepts evidence matching the authoritative terminal run', () => {
@@ -1080,14 +1123,20 @@ test('manual rerun API executes the current Eval through the live canonical sess
   };
   const handler = createEvaluationApiHandler(ctx, service, evaluationTool);
 
-  const [status, body] = await handler(jsonRequest('POST', {
+  const request = jsonRequest('POST', {
     workspaceId: 'workspace-1',
     sessionId: 'session-root',
-  }));
+  });
+  const completedRequest = new AbortController();
+  completedRequest.abort();
+  request.signal = completedRequest.signal;
+  const operation = new AbortController();
+  const [status, body] = await handler(request, operation.signal);
 
   assert.equal(status, 200);
   assert.deepEqual(execution.args, {});
   assert.equal(execution.value.agent, agent);
+  assert.equal(execution.value.signal, operation.signal);
   assert.equal(body.evaluationRun.status, 'passed');
   assert.equal(body.state, state);
 });
@@ -1117,13 +1166,22 @@ test('real work APIs run member input and append version-bound feedback through 
     },
   };
 
-  const [runStatus, runBody] = await createRealWorkRunApiHandler(ctx, service, workRun)(jsonRequest('POST', {
+  const runRequest = jsonRequest('POST', {
     workspaceId: 'workspace-1', sessionId: 'session-root', caseTitle: '九月客户记录',
     input: { transcript: '客户希望下周回访' },
-  }));
+  });
+  const completedRequest = new AbortController();
+  completedRequest.abort();
+  runRequest.signal = completedRequest.signal;
+  const operation = new AbortController();
+  const [runStatus, runBody] = await createRealWorkRunApiHandler(ctx, service, workRun)(
+    runRequest,
+    operation.signal,
+  );
   assert.equal(runStatus, 200);
   assert.deepEqual(runExecution.args, { caseTitle: '九月客户记录', input: { transcript: '客户希望下周回访' } });
   assert.equal(runExecution.value.agent, agent);
+  assert.equal(runExecution.value.signal, operation.signal);
   assert.equal(runBody.workRun.runId, 'run-real-1');
 
   const [feedbackStatus] = await createRunFeedbackApiHandler(ctx, service)(jsonRequest('POST', {
@@ -1185,6 +1243,21 @@ function jsonRequest(method, payload) {
     method,
     async *[Symbol.asyncIterator]() { yield body; },
   };
+}
+
+function responseFixture() {
+  const response = new EventEmitter();
+  response.writableFinished = false;
+  response.writeHead = (status, headers) => {
+    response.status = status;
+    response.headers = headers;
+  };
+  response.end = (body) => {
+    response.body = body;
+    response.writableFinished = true;
+    response.emit('close');
+  };
+  return response;
 }
 
 async function writeFileAfterMkdir(filename, contents) {

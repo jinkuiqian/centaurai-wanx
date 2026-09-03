@@ -531,21 +531,21 @@ export function createActivationApiHandler(ctx, service, authorization = null) {
 }
 
 export function createEvaluationApiHandler(ctx, service, evaluationTool) {
-  return async (request) => {
+  return async (request, operationSignal) => {
     requireMethod(request, 'POST');
     const payload = requireObject(await readJson(request));
     rejectUnknownKeys(payload, ['workspaceId', 'sessionId'], '评测重跑参数');
     const workspaceId = requiredText(payload.workspaceId, '项目 ID', 200);
     const sessionId = requiredText(payload.sessionId, '会话 ID', 200);
     const agent = await requireActivationAgent(ctx, service, workspaceId, sessionId, { requireIdle: true });
-    const evaluationRun = await evaluationTool.execute({}, { agent, signal: request.signal });
+    const evaluationRun = await evaluationTool.execute({}, { agent, signal: operationSignal });
     const snapshot = await service.getProjectEvidence(workspaceId);
     return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation, evaluationRun })];
   };
 }
 
 export function createRealWorkRunApiHandler(ctx, service, workRun) {
-  return async (request) => {
+  return async (request, operationSignal) => {
     requireMethod(request, 'POST');
     const payload = requireObject(await readJson(request));
     rejectUnknownKeys(payload, ['workspaceId', 'sessionId', 'caseTitle', 'input'], '影子运行参数');
@@ -557,7 +557,7 @@ export function createRealWorkRunApiHandler(ctx, service, workRun) {
     if (typeof workRun?.execute !== 'function') {
       throw serviceError(503, 'work_run_unavailable', '影子运行环境尚未就绪。');
     }
-    const run = await workRun.execute({ caseTitle, input }, { agent, signal: request.signal });
+    const run = await workRun.execute({ caseTitle, input }, { agent, signal: operationSignal });
     const snapshot = await service.getProjectEvidence(workspaceId);
     return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation, workRun: run })];
   };
@@ -1276,7 +1276,7 @@ function structuredErrorValue(error) {
   };
 }
 
-function registerApi(ctx, routePath, handler) {
+export function registerApi(ctx, routePath, handler) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: routePath,
@@ -1284,8 +1284,13 @@ function registerApi(ctx, routePath, handler) {
       if (!sameOrigin(request)) {
         return respondJson(response, 403, { ok: false, code: 'invalid_origin', message: '请求来源不受信任。' });
       }
+      const operation = new AbortController();
+      const abortOnDisconnect = () => {
+        if (!response.writableFinished) operation.abort();
+      };
+      response.once('close', abortOnDisconnect);
       try {
-        const [status, body] = await handler(request);
+        const [status, body] = await handler(request, operation.signal);
         return respondJson(response, status, body);
       } catch (error) {
         const status = Number(error?.statusCode) || 500;
@@ -1297,6 +1302,8 @@ function registerApi(ctx, routePath, handler) {
         };
         if (error?.current) body.current = error.current;
         return respondJson(response, status, body);
+      } finally {
+        response.off('close', abortOnDisconnect);
       }
     },
   }));
