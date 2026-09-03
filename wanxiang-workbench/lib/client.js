@@ -647,6 +647,17 @@ window.__ModuleLoader__.load({
       const canPrefill = !firstTurnPending && !draftText.trim() && typeof inputActions?.setDraft === "function";
       const nextKicker = guidance.next.audience === "agent" ? "万象正在只读检查" : "下一步";
       React.useEffect(() => {
+        const workspaceId = workspace?.workspaceId;
+        if (!workspaceId) return undefined;
+        let refreshing = false;
+        const refresh = () => {
+          if (refreshing || record?.busy) return;
+          refreshing = true;
+          void loadProject(workspaceId, true).finally(() => { refreshing = false; });
+        };
+        return rootContext.sessions.list.subscribe(refresh);
+      }, [workspace?.workspaceId, record?.busy]);
+      React.useEffect(() => {
         setCollapsed(["making", "activating"].includes(stage));
         setPrefilled(false);
         setModel("checking");

@@ -208,8 +208,12 @@ export function createProxyRunToolAdapter({
       }
       const context = await projectService.contextForAgent(agent);
       if (!context?.state) throw proxyRunError('proxy_run_project_required', '当前会话没有可代理运行的万象项目。', 403);
+      const revision = context.state.brief?.revision;
+      const activationReady = context.state.work?.activeRevision === revision
+        || (context.state.work?.activation?.status === 'pending'
+          && context.state.work.activation.briefRevision === revision);
       if (context.state.work?.sessionId !== sessionId
-        || context.state.work?.activeRevision !== context.state.brief?.revision) {
+        || !activationReady) {
         throw proxyRunError('proxy_run_activation_required', '请先在当前会话确认工作说明并开始制作。', 409);
       }
       if (!evaluationStore || !runner || !context.workspacePath) {

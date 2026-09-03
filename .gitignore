@@ -9,6 +9,8 @@ build/
 .cache/
 .next/
 coverage/
+playwright-report/
+test-results/
 .git-sites-backup/
 
 .idea/

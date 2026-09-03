@@ -228,6 +228,43 @@ test('work Agent generation tool rejects sessions without the active confirmed w
   });
 });
 
+test('work Agent generation tool accepts the confirmed activation prompt while it is pending', async () => {
+  const agent = { id: 'session-root', session: { header: {} } };
+  const state = createInitialState('待启动项目');
+  state.brief.revision = 2;
+  state.brief.confirmedRevision = 2;
+  state.brief.confirmedAnswers = { ...state.brief.answers };
+  state.work = {
+    sessionId: 'session-root',
+    activeRevision: null,
+    activation: { status: 'pending', briefRevision: 2 },
+  };
+  const tool = createWorkAgentGenerationTool({
+    async contextForAgent() {
+      return { workspaceId: 'workspace-1', workspacePath: '/managed/project', state };
+    },
+  }, {
+    async generate(_project, request) {
+      return {
+        agent: { agentVersion: '1.0.0', workBriefRevision: 2, workflowVersion: '1.0.0', evalRevision: 1 },
+        eval: { cases: [{ id: request.smokeCase.id }] },
+      };
+    },
+  }, {
+    async execute() { return { status: 'passed' }; },
+  });
+
+  const result = await tool.execute({
+    workflowSource: "process.stdout.write('{}');\n",
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    smokeCase: { id: 'smoke-v1', title: '冒烟', input: {}, expected: {} },
+  }, { agent });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.workBriefRevision, 2);
+});
+
 test('work Agent generation failure records an accepted contract improvement as recoverable', async () => {
   const agent = { id: 'session-root', session: { header: { cwd: '/managed/project' } } };
   const state = createInitialState('项目');
@@ -1080,13 +1117,18 @@ test('real work APIs run member input and append version-bound feedback through 
     },
   };
 
-  const [runStatus, runBody] = await createRealWorkRunApiHandler(ctx, service, workRun)(jsonRequest('POST', {
+  const runRequest = jsonRequest('POST', {
     workspaceId: 'workspace-1', sessionId: 'session-root', caseTitle: '九月客户记录',
     input: { transcript: '客户希望下周回访' },
-  }));
+  });
+  const staleRequest = new AbortController();
+  staleRequest.abort();
+  runRequest.signal = staleRequest.signal;
+  const [runStatus, runBody] = await createRealWorkRunApiHandler(ctx, service, workRun)(runRequest);
   assert.equal(runStatus, 200);
   assert.deepEqual(runExecution.args, { caseTitle: '九月客户记录', input: { transcript: '客户希望下周回访' } });
   assert.equal(runExecution.value.agent, agent);
+  assert.equal(runExecution.value.signal, undefined);
   assert.equal(runBody.workRun.runId, 'run-real-1');
 
   const [feedbackStatus] = await createRunFeedbackApiHandler(ctx, service)(jsonRequest('POST', {

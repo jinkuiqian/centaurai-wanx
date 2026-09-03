@@ -5,7 +5,12 @@
   "description": "万象：把真实工作沉淀成可靠、可重复运行的能力",
   "scripts": {
     "start": "pnpm --dir wanxiang-runtime start",
-    "test": "pnpm --dir wanxiang-runtime test && pnpm --dir wanxiang-workbench test"
+    "test": "pnpm test:unit && pnpm test:e2e",
+    "test:unit": "pnpm --dir wanxiang-runtime test && pnpm --dir wanxiang-workbench test",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
   },
   "packageManager": "pnpm@11.7.0"
 }

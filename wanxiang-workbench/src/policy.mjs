@@ -364,8 +364,12 @@ export function createWorkAgentGenerationTool(
       }
       const context = await service.contextForAgent(agent);
       const state = context?.state;
+      const revision = state?.brief?.revision;
+      const activationReady = state?.work?.activeRevision === revision
+        || (state?.work?.activation?.status === 'pending'
+          && state.work.activation.briefRevision === revision);
       if (!state || state.work?.sessionId !== sessionId
-        || state.work?.activeRevision !== state.brief?.revision
+        || !activationReady
         || state.brief?.confirmedRevision !== state.brief?.revision
         || !state.brief?.confirmedAnswers) {
         throw serviceError(409, 'agent_generation_activation_required', '请先确认当前工作说明并在这个会话开始制作。');
@@ -553,7 +557,8 @@ export function createRealWorkRunApiHandler(ctx, service, workRun) {
     if (typeof workRun?.execute !== 'function') {
       throw serviceError(503, 'work_run_unavailable', '影子运行环境尚未就绪。');
     }
-    const run = await workRun.execute({ caseTitle, input }, { agent, signal: request.signal });
+    const signal = request.signal?.aborted ? undefined : request.signal;
+    const run = await workRun.execute({ caseTitle, input }, { agent, signal });
     const snapshot = await service.getProjectEvidence(workspaceId);
     return [200, createProjectResponse(snapshot.state, { evaluation: snapshot.evaluation, workRun: run })];
   };
